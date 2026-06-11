@@ -1,0 +1,9 @@
+CompileFlags:
+  Add:
+    - "-Id:/libdwg2text/src"
+    - "-Id:/libdwg2text/src/include"
+    - "-Id:/libdwg2text/test"
+    - "-D_CRT_SECURE_NO_WARNINGS"
+  Remove:
+    - "-std=*"
+    - "-fobjc*"
