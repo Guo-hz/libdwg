@@ -28,8 +28,6 @@
 EXPORT int dwg_write_json (Bit_Chain *restrict dat, Dwg_Data *restrict dwg);
 EXPORT int dwg_write_geojson (Bit_Chain *restrict dat, Dwg_Data *restrict dwg);
 
-EXPORT int dwg_geojson_layers_text(char** cszTextOut, Dwg_Data *restrict dwg);//---------------------------new
-
 // converts a TV to a UTF-8 string (with codepage conversion) and quoting
 // ", \n \r, U+XXXX
 char *json_cquote (char *restrict dest, const char *restrict src,

@@ -44,6 +44,7 @@
 #include "dwg.h"
 #include "decode.h"
 #include "out_json.h"
+#include "dwg_text_api.h"
 #include "geom.h"
 //extern char *convert_to_utf8(const char *str, int dwg_cp);//------------------------------------------------------------newnewnewnenwnewn
 /* the current version per spec block */
@@ -2442,12 +2443,12 @@ dwg_write_geojson(Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
 	if (!dwg || !dwg->num_objects || !dat || !dat->fh)
 		return 1;
 
-	error = dwg_geojson_layers_text(&json, dwg);
+	error = dwgcore_extract_geojson_text(dwg, &json, NULL);
 	if (error || !json)
 		return 1;
 
 	fputs(json, dat->fh);
-	free(json);
+	dwgcore_free(json);
 	return ferror(dat->fh) ? 1 : 0;
 }
 

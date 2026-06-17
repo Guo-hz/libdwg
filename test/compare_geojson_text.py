@@ -24,18 +24,22 @@ def read_truth(path: Path) -> list[str]:
             if line.strip()]
 
 
-def read_geojson_texts(path: Path) -> tuple[list[str], list[str],
-                                           dict[str, list[str]]]:
+def read_geojson_texts(path: Path, skip_layers: set[str] | None = None
+                       ) -> tuple[list[str], list[str],
+                                  dict[str, list[str]]]:
     source = path.read_text(encoding="utf-8", errors="replace")
     try:
         data = json.loads(source)
     except json.JSONDecodeError:
-        return read_tolerant_geojson_texts(source)
+        return read_tolerant_geojson_texts(source, skip_layers)
     layers: list[str] = []
     texts: list[str] = []
     text_layers: dict[str, list[str]] = collections.defaultdict(list)
+    skip_layers = skip_layers or set()
     for layer in data:
         name = layer.get("Layer", "")
+        if name in skip_layers:
+            continue
         layers.append(name)
         for value in layer.get("Text", []):
             text = str(value)
@@ -44,8 +48,9 @@ def read_geojson_texts(path: Path) -> tuple[list[str], list[str],
     return layers, texts, text_layers
 
 
-def read_tolerant_geojson_texts(source: str) -> tuple[list[str], list[str],
-                                                     dict[str, list[str]]]:
+def read_tolerant_geojson_texts(source: str, skip_layers: set[str] | None = None
+                                ) -> tuple[list[str], list[str],
+                                           dict[str, list[str]]]:
     """Read historical/broken GeoJSON-like dumps used as oracle files.
 
     Some reference files contain a leading quoted text list followed by
@@ -56,6 +61,7 @@ def read_tolerant_geojson_texts(source: str) -> tuple[list[str], list[str],
     texts: list[str] = []
     text_layers: dict[str, list[str]] = collections.defaultdict(list)
     current_layer = ""
+    skip_layers = skip_layers or set()
 
     for line in source.splitlines():
         layer_match = re.search(r'"Layer"\s*:\s*"((?:[^"\\]|\\.)*)"', line)
@@ -64,7 +70,11 @@ def read_tolerant_geojson_texts(source: str) -> tuple[list[str], list[str],
                 current_layer = json.loads(f'"{layer_match.group(1)}"')
             except json.JSONDecodeError:
                 current_layer = layer_match.group(1)
-            layers.append(current_layer)
+            if current_layer not in skip_layers:
+                layers.append(current_layer)
+            continue
+
+        if current_layer in skip_layers:
             continue
 
         if '"Text"' in line and len(re.findall(r'"((?:[^"\\]|\\.)*)"', line)) <= 1:
@@ -102,9 +112,22 @@ def read_raw_dump(path: Path | None) -> dict[str, list[str]]:
 
 
 def raw_unassigned_text_count(path: Path) -> int:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return 0
     return sum(len(layer.get("Text", [])) for layer in data
                if layer.get("Layer", "") == "__RAW_UNASSIGNED__")
+
+
+def read_geojson_layer_counters(path: Path) -> dict[str, collections.Counter[str]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    layers: dict[str, collections.Counter[str]] = {}
+    for layer in data:
+        name = str(layer.get("Layer", ""))
+        layers[name] = collections.Counter(str(value)
+                                           for value in layer.get("Text", []))
+    return layers
 
 
 def expand_positive_delta(left: collections.Counter[str],
@@ -124,13 +147,44 @@ def main() -> int:
     parser.add_argument("--show", type=int, default=40)
     parser.add_argument("--probe", action="append", default=[])
     parser.add_argument("--raw-dump", type=Path)
+    parser.add_argument("--skip-layer", action="append", default=[])
+    parser.add_argument("--compare-geojson", action="store_true",
+                        help="Compare truth and geojson as layer/text counters, ignoring order.")
     args = parser.parse_args()
 
+    if args.compare_geojson:
+        expected = read_geojson_layer_counters(args.truth)
+        actual = read_geojson_layer_counters(args.geojson)
+        missing_layers = sorted(set(expected) - set(actual))
+        extra_layers = sorted(set(actual) - set(expected))
+        diff_layers = []
+        for layer in sorted(set(expected) & set(actual)):
+            if expected[layer] != actual[layer]:
+                diff_layers.append(layer)
+        print(f"expected_layers={len(expected)} actual_layers={len(actual)}")
+        print(f"missing_layers={len(missing_layers)} extra_layers={len(extra_layers)} "
+              f"diff_layers={len(diff_layers)}")
+        for name in missing_layers[:args.show]:
+            print(f"missing_layer: {name}")
+        for name in extra_layers[:args.show]:
+            print(f"extra_layer: {name}")
+        for name in diff_layers[:args.show]:
+            missing = expected[name] - actual[name]
+            extra = actual[name] - expected[name]
+            print(f"diff_layer: {name} missing={sum(missing.values())} "
+                  f"extra={sum(extra.values())}")
+            for value, count in missing.most_common(5):
+                print(f"  missing {count}: {value}")
+            for value, count in extra.most_common(5):
+                print(f"  extra {count}: {value}")
+        return 1 if missing_layers or extra_layers or diff_layers else 0
+
+    skip_layers = set(args.skip_layer)
     if args.truth.suffix.lower() in {".json", ".geojson"}:
-        _, truth, _ = read_geojson_texts(args.truth)
+        _, truth, _ = read_geojson_texts(args.truth, skip_layers)
     else:
         truth = read_truth(args.truth)
-    layers, output, text_layers = read_geojson_texts(args.geojson)
+    layers, output, text_layers = read_geojson_texts(args.geojson, skip_layers)
     raw_sources = read_raw_dump(args.raw_dump)
     truth_counter = collections.Counter(truth)
     output_counter = collections.Counter(output)
@@ -189,7 +243,7 @@ def main() -> int:
         if item in raw_sources:
             source_text = " raw=" + "; ".join(raw_sources[item][:3])
         print(f"  {item} layers=[{layer_text}]{source_text}")
-    return 0
+    return 1 if missing or extra else 0
 
 
 if __name__ == "__main__":

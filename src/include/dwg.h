@@ -11501,6 +11501,7 @@ typedef struct _dwg_struct
   Dwg_Object_Ref **object_ordered_ref; /*! list of all ordered objects refs */
   BITCODE_BL num_object_ordered_refs;  /*! number of ordered objects refs */
   Dwg_RawTextRecovery r2007_raw_texts;  /*! recovered raw R2007 text strings */
+  BITCODE_B r2007_text_span_recovery_active; /*!< severe R2007 TEXT span recovery was used */
 } Dwg_Data;
 
 #define DWG_OPTS_LOGLEVEL 0xf

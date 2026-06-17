@@ -2172,6 +2172,100 @@ r2007_recover_unresolved_layers_linear (Dwg_Data *restrict dwg,
   return error;
 }
 
+static void
+r2007_dump_probe_spans (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat)
+{
+  const char *dump_path = getenv ("LIBDWG_DUMP_R2007_SPANS");
+  FILE *fp;
+
+  if (!dump_path || !dump_path[0] || !obj_dat || !obj_dat->chain)
+    return;
+
+  fp = fopen (dump_path, "wb");
+  if (!fp)
+    return;
+
+  fprintf (fp, "address\tbody_address\tend_address\tsize\tbitsize\ttype\thandle\n");
+  for (size_t address = 0; address + 12 < obj_dat->size; address++)
+    {
+      r2007_probe probe;
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      fprintf (fp, "%" PRIuSIZE "\t%" PRIuSIZE "\t%" PRIuSIZE
+               "\t%lu\t%lu\t%u\t%llX\n",
+               probe.address, probe.body_address,
+               probe.body_address + probe.size, (unsigned long)probe.size,
+               (unsigned long)probe.bitsize, (unsigned)probe.type,
+               (unsigned long long)probe.handle);
+    }
+
+  fclose (fp);
+}
+
+static int
+r2007_allow_speculative_text_recovery (void)
+{
+  const char *env = getenv ("LIBDWG_R2007_SPECULATIVE_TEXT_RECOVERY");
+  return env && env[0] && env[0] != '0';
+}
+
+static int
+r2007_allow_all_text_span_recovery (void)
+{
+  const char *env = getenv ("LIBDWG_R2007_RECOVER_ALL_TEXT_SPANS");
+  return env && env[0] && env[0] != '0';
+}
+
+static int
+r2007_disable_text_span_recovery (void)
+{
+  const char *env = getenv ("LIBDWG_R2007_DISABLE_TEXT_SPAN_RECOVERY");
+  return env && env[0] && env[0] != '0';
+}
+
+static int
+r2007_recover_all_text_spans (Dwg_Data *restrict dwg,
+                              Bit_Chain *restrict obj_dat,
+                              Bit_Chain *restrict hdl,
+                              unsigned *recovered_textlike)
+{
+  int error = 0;
+  unsigned long max_size = 512;
+  const char *max_env = getenv ("LIBDWG_R2007_TEXT_SPAN_MAX_SIZE");
+
+  if (max_env && max_env[0])
+    {
+      unsigned long value = strtoul (max_env, NULL, 10);
+      if (value >= 24 && value <= 8192)
+        max_size = value;
+    }
+
+  if (!obj_dat || !obj_dat->chain)
+    return 0;
+
+  for (size_t address = 0; address + 12 < obj_dat->size; address++)
+    {
+      r2007_probe probe;
+      int decoded;
+
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      if (probe.type != DWG_TYPE_TEXT)
+        continue;
+      if (probe.size < 24 || probe.size > max_size)
+        continue;
+      if (r2007_object_has_handle (dwg, probe.handle))
+        continue;
+
+      decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl, &probe,
+                                             &error);
+      if (decoded > 0)
+        (*recovered_textlike)++;
+    }
+
+  return error;
+}
+
 static int
 recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
                                 Bit_Chain *restrict obj_dat,
@@ -2190,6 +2284,9 @@ recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
   unsigned raw_text_hits = 0;
   unsigned raw_text_probe_hits = 0;
   int error = 0;
+  int allow_speculative_text = r2007_allow_speculative_text_recovery ();
+  int force_all_text_spans = r2007_allow_all_text_span_recovery ();
+  int allow_all_text_spans = 0;
   r2007_handle_vec decoded_addresses = { 0 };
 
   if (obj_dat && obj_dat->chain && obj_dat->size >= 4)
@@ -2231,6 +2328,11 @@ recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
   LOG_INFO ("R2007 recovery: %u unresolved layer handles, "
             "high-handle floor " FORMAT_HV "\n",
             (unsigned)unresolved_layers.num, high_handle_floor);
+  allow_all_text_spans
+      = force_all_text_spans
+        || (!r2007_disable_text_span_recovery ()
+            && unresolved_layers.num >= 8 && raw_utf16_s_eq >= 100);
+  dwg->r2007_text_span_recovery_active = allow_all_text_spans ? 1 : 0;
 
   error |= r2007_recover_unresolved_layers_linear (
       dwg, obj_dat, hdl, &unresolved_layers, &recovered_layers);
@@ -2241,23 +2343,28 @@ recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
       error |= r2007_recover_near_handle_pattern (
           dwg, obj_dat, hdl, layer_handle, 0, 1, &recovered_layers,
           &recovered_textlike, &pattern_hits, &probe_hits);
-      error |= r2007_recover_near_handle_pattern (
-          dwg, obj_dat, hdl, layer_handle, 5, 0, &recovered_layers,
-          &recovered_textlike, &pattern_hits, &probe_hits);
+      if (allow_speculative_text)
+        error |= r2007_recover_near_handle_pattern (
+            dwg, obj_dat, hdl, layer_handle, 5, 0, &recovered_layers,
+            &recovered_textlike, &pattern_hits, &probe_hits);
     }
 
-  {
-    static const BITCODE_RC s_eq_ascii[] = { 'S', '=' };
-    static const BITCODE_RC s_eq_utf16[] = { 'S', 0, '=', 0 };
-    error |= r2007_recover_near_text_pattern (
-        dwg, obj_dat, hdl, s_eq_ascii, sizeof (s_eq_ascii),
-        &decoded_addresses, &raw_text_hits, &raw_text_probe_hits,
-        &recovered_textlike);
-    error |= r2007_recover_near_text_pattern (
-        dwg, obj_dat, hdl, s_eq_utf16, sizeof (s_eq_utf16),
-        &decoded_addresses, &raw_text_hits, &raw_text_probe_hits,
-        &recovered_textlike);
-  }
+  if (allow_speculative_text)
+    {
+      static const BITCODE_RC s_eq_ascii[] = { 'S', '=' };
+      static const BITCODE_RC s_eq_utf16[] = { 'S', 0, '=', 0 };
+      error |= r2007_recover_near_text_pattern (
+          dwg, obj_dat, hdl, s_eq_ascii, sizeof (s_eq_ascii),
+          &decoded_addresses, &raw_text_hits, &raw_text_probe_hits,
+          &recovered_textlike);
+      error |= r2007_recover_near_text_pattern (
+          dwg, obj_dat, hdl, s_eq_utf16, sizeof (s_eq_utf16),
+          &decoded_addresses, &raw_text_hits, &raw_text_probe_hits,
+          &recovered_textlike);
+    }
+  if (allow_all_text_spans)
+    error |= r2007_recover_all_text_spans (dwg, obj_dat, hdl,
+                                           &recovered_textlike);
 
   LOG_INFO ("R2007 recovery recovered layers %u, "
             "text-like objects %u\n",
@@ -2267,11 +2374,13 @@ recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
            "raw_S_eq_ascii=%u, raw_S_eq_utf16=%u, pattern_hits=%u, "
            "probe_hits=%u, raw_S_151_94_ascii=%u, raw_S_151_94_utf16=%u, "
            "raw_text_hits=%u, raw_text_probe_hits=%u, "
-           "recovered_layers=%u, recovered_textlike=%u\n",
+           "recovered_layers=%u, recovered_textlike=%u, "
+           "speculative_text_recovery=%u, all_text_span_recovery=%u\n",
            (unsigned)unresolved_layers.num, raw_ascii_s_eq, raw_utf16_s_eq,
            pattern_hits, probe_hits, raw_ascii_s_151_94, raw_utf16_s_151_94,
            raw_text_hits, raw_text_probe_hits, recovered_layers,
-           recovered_textlike);
+           recovered_textlike, (unsigned)allow_speculative_text,
+           (unsigned)allow_all_text_spans);
   r2007_handle_vec_free (&decoded_addresses);
   r2007_handle_vec_free (&unresolved_layers);
   return error;
@@ -2340,6 +2449,7 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
   unsigned failed_objects = 0;
   unsigned handle_mismatches = 0;
   int error;
+  FILE *map_fp = NULL;
 
   error = read_data_section (&obj_dat, dat, sections_map, pages_map,
                              SECTION_OBJECTS);
@@ -2350,6 +2460,29 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
         free (obj_dat.chain);
       return error;
     }
+  {
+    const char *dump_path = getenv ("LIBDWG_DUMP_R2007_OBJECTS");
+    if (dump_path && dump_path[0])
+      {
+        FILE *fp = fopen (dump_path, "wb");
+        if (fp)
+          {
+            fwrite (obj_dat.chain, 1, obj_dat.size, fp);
+            fclose (fp);
+          }
+      }
+  }
+  r2007_dump_probe_spans (dwg, &obj_dat);
+  {
+    const char *map_path = getenv ("LIBDWG_DUMP_R2007_MAP");
+    if (map_path && map_path[0])
+      {
+        map_fp = fopen (map_path, "wb");
+        if (map_fp)
+          fprintf (map_fp,
+                   "page\tmap_offset\texpected_handle\tdecoded_index\tdecoded_handle\tdecoded_type\tstatus\n");
+      }
+  }
 
   LOG_TRACE ("\nHandles\n-------------------\n");
   error = read_data_section (&hdl_dat, dat, sections_map, pages_map,
@@ -2459,6 +2592,26 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
                             (unsigned long)added_obj->index, last_offset);
                 }
             }
+          if (map_fp)
+            {
+              if (dwg->num_objects > prev_num_objects)
+                {
+                  Dwg_Object *added_obj = &dwg->object[dwg->num_objects - 1];
+                  fprintf (map_fp, "%u\t%" PRIuSIZE "\t%llX\t%lu\t%llX\t%u\t%s\n",
+                           page_index, last_offset,
+                           (unsigned long long)expected_handle,
+                           (unsigned long)added_obj->index,
+                           (unsigned long long)added_obj->handle.value,
+                           (unsigned)added_obj->fixedtype,
+                           added > 0 ? "decoded_with_error" : "decoded");
+                }
+              else
+                {
+                  fprintf (map_fp, "%u\t%" PRIuSIZE "\t%llX\t\t\t\tfailed\n",
+                           page_index, last_offset,
+                           (unsigned long long)expected_handle);
+                }
+            }
           last_handle = expected_handle;
           map_last_handle = expected_handle;
           map_last_offset = last_offset;
@@ -2521,6 +2674,8 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
 
   error |= recover_r2007_unmapped_objects (dwg, &obj_dat, hdl);
 
+  if (map_fp)
+    fclose (map_fp);
   if (hdl_dat.chain)
     free (hdl_dat.chain);
   if (obj_dat.chain)

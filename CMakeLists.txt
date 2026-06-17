@@ -47,6 +47,7 @@ set(LIB_SOURCES
     src/in_dxf.c
     src/reedsolomon.c
     src/geojson_api.c
+    src/dwg_text_api.c
 )
 
 # ============================================================
@@ -218,18 +219,18 @@ endif()
 
 # --- 平台特定链接库 ---
 if(WIN32)
-    target_link_libraries(dwg2text ws2_32)
+    target_link_libraries(dwgcore PUBLIC ws2_32)
 endif()
 
 if(MATH_LIB)
-    target_link_libraries(dwg2text ${MATH_LIB})
+    target_link_libraries(dwgcore PUBLIC ${MATH_LIB})
 endif()
 
 # --- 可选 iconv ---
 find_package(Iconv)
 if(Iconv_FOUND)
-    target_include_directories(dwgcore PRIVATE ${Iconv_INCLUDE_DIRS})
-    target_link_libraries(dwg2text ${Iconv_LIBRARIES})
+    target_include_directories(dwgcore PUBLIC ${Iconv_INCLUDE_DIRS})
+    target_link_libraries(dwgcore PUBLIC ${Iconv_LIBRARIES})
 endif()
 
 # --- 编译定义（必须在 target 创建之后） ---

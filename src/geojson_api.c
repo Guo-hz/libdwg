@@ -47,7 +47,9 @@ typedef struct
   BITCODE_BL object_count;
   int from_tu;
   int free_table_names;
+  int trim_output_text;
   BITCODE_RS codepage;
+  FILE *diag;
 } TextExtractCtx;
 
 static void
@@ -523,19 +525,177 @@ get_entity_layer_name_escaped (TextExtractCtx *ctx, const Dwg_Object *obj,
                         : default_layer_escaped (ctx, "0");
 }
 
+static BITCODE_RLL
+entity_owner_abs (const Dwg_Object *obj)
+{
+  if (!obj || obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+    return 0;
+  return ref_abs_value (obj->tio.entity->ownerhandle);
+}
+
+static BITCODE_RLL
+entity_style_abs (const Dwg_Object *obj)
+{
+  if (!obj || obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+    return 0;
+  switch (obj->fixedtype)
+    {
+    case DWG_TYPE_TEXT:
+      return obj->tio.entity->tio.TEXT
+                 ? ref_abs_value (obj->tio.entity->tio.TEXT->style)
+                 : 0;
+    case DWG_TYPE_ATTRIB:
+      return obj->tio.entity->tio.ATTRIB
+                 ? ref_abs_value (obj->tio.entity->tio.ATTRIB->style)
+                 : 0;
+    case DWG_TYPE_ATTDEF:
+      return obj->tio.entity->tio.ATTDEF
+                 ? ref_abs_value (obj->tio.entity->tio.ATTDEF->style)
+                 : 0;
+    default:
+      return 0;
+    }
+}
+
+static char *
+entity_text_for_diag (TextExtractCtx *ctx, const Dwg_Object *obj)
+{
+  if (!obj || obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+    return NULL;
+  switch (obj->fixedtype)
+    {
+    case DWG_TYPE_TEXT:
+      return obj->tio.entity->tio.TEXT
+                 ? convert_text_alloc (ctx, obj->tio.entity->tio.TEXT->text_value)
+                 : NULL;
+    case DWG_TYPE_ATTRIB:
+      return obj->tio.entity->tio.ATTRIB
+                 ? convert_text_alloc (ctx, obj->tio.entity->tio.ATTRIB->text_value)
+                 : NULL;
+    case DWG_TYPE_ATTDEF:
+      return obj->tio.entity->tio.ATTDEF
+                 ? convert_text_alloc (ctx,
+                                       obj->tio.entity->tio.ATTDEF->default_value)
+                 : NULL;
+    case DWG_TYPE_MTEXT:
+      return obj->tio.entity->tio.MTEXT
+                 ? convert_text_alloc (ctx, obj->tio.entity->tio.MTEXT->text)
+                 : NULL;
+    default:
+      return NULL;
+    }
+}
+
+static void
+write_entity_diag (TextExtractCtx *ctx)
+{
+  BITCODE_BL i;
+
+  if (!ctx->diag)
+    return;
+  fprintf (ctx->diag,
+           "index\thandle\taddress\tsize\tbitsize\ttype\tfixedtype\tlayer\towner\tprev\tnext\tstyle\tinvisible\tcolor\tltype_flags\ttext_x\ttext_y\ttext_height\ttext_rotation\ttext_flags\ttext\n");
+  for (i = 0; i < ctx->dwg->num_objects; i++)
+    {
+      Dwg_Object *obj = &ctx->dwg->object[i];
+      char *layer_name;
+      char *text;
+      char *text_esc = NULL;
+
+      if (obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+        continue;
+      layer_name = get_entity_layer_name_escaped (ctx, obj, NULL);
+      text = entity_text_for_diag (ctx, obj);
+      if (text)
+        text_esc = escape_string_alloc (ctx, text, ctx->codepage);
+      {
+        double text_x = 0.0, text_y = 0.0, text_height = 0.0;
+        double text_rotation = 0.0;
+        unsigned text_flags = 0;
+        if (obj->fixedtype == DWG_TYPE_TEXT && obj->tio.entity->tio.TEXT)
+          {
+            Dwg_Entity_TEXT *txt = obj->tio.entity->tio.TEXT;
+            text_x = txt->ins_pt.x;
+            text_y = txt->ins_pt.y;
+            text_height = txt->height;
+            text_rotation = txt->rotation;
+            text_flags = txt->dataflags;
+          }
+        fprintf (ctx->diag,
+                 "%lu\t%llX\t%" PRIuSIZE "\t%lu\t%lu\t%s\t%d\t%s\t%llX\t%llX\t%llX\t%llX\t%u\t%d\t%u\t%.17g\t%.17g\t%.17g\t%.17g\t%u\t%s\n",
+                 (unsigned long)obj->index,
+                 (unsigned long long)obj->handle.value, obj->address,
+                 (unsigned long)obj->size, (unsigned long)obj->bitsize,
+                 obj->name ? obj->name : (obj->dxfname ? obj->dxfname : ""),
+                 (int)obj->fixedtype, layer_name ? layer_name : "",
+                 (unsigned long long)entity_owner_abs (obj),
+                 (unsigned long long)(obj->tio.entity->prev_entity
+                                           ? obj->tio.entity->prev_entity
+                                                 ->absolute_ref
+                                           : 0),
+                 (unsigned long long)(obj->tio.entity->next_entity
+                                           ? obj->tio.entity->next_entity
+                                                 ->absolute_ref
+                                           : 0),
+                 (unsigned long long)entity_style_abs (obj),
+                 (unsigned)obj->tio.entity->invisible,
+                 (int)obj->tio.entity->color.index,
+                 (unsigned)obj->tio.entity->ltype_flags, text_x, text_y,
+                 text_height, text_rotation, text_flags, text_esc ? text_esc : "");
+      }
+      free (text_esc);
+      free (text);
+      free (layer_name);
+    }
+}
+
 static void
 append_raw_text_to_layer (TextExtractCtx *ctx, const char *layer_name,
                           const char *raw_text)
 {
+  char *trimmed;
+  char *start;
+  char *end;
   char *json_text;
   int idx;
 
   if (!raw_text || raw_text[0] == '\0')
     return;
 
-  json_text = escape_string_alloc (ctx, raw_text, ctx->codepage);
+  if (ctx->trim_output_text)
+    {
+      trimmed = strdup (raw_text);
+      if (!trimmed)
+        return;
+      start = trimmed;
+      while (*start == ' ' || *start == '\t' || *start == '\r'
+             || *start == '\n' || *start == '\f' || *start == '\v')
+        start++;
+      end = start + strlen (start);
+      while (end > start
+             && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'
+                 || end[-1] == '\n' || end[-1] == '\f'
+                 || end[-1] == '\v'))
+        end--;
+      *end = '\0';
+      if (start[0] == '\0')
+        {
+          free (trimmed);
+          return;
+        }
+    }
+  else
+    {
+      trimmed = NULL;
+      start = (char *)raw_text;
+    }
+
+  json_text = escape_string_alloc (ctx, start, ctx->codepage);
   if (!json_text)
-    return;
+    {
+      free (trimmed);
+      return;
+    }
 
   idx = find_or_create_layer (&ctx->layers,
                               layer_name && layer_name[0] ? layer_name
@@ -543,6 +703,7 @@ append_raw_text_to_layer (TextExtractCtx *ctx, const char *layer_name,
   if (idx >= 0)
     add_text_to_layer (&ctx->layers, idx, json_text);
   free (json_text);
+  free (trimmed);
 }
 
 static void
@@ -571,45 +732,6 @@ dimension_common (const Dwg_Object *obj)
 }
 
 static void
-append_generated_dimension_text (TextExtractCtx *ctx, const char *layer_name,
-                                 const Dwg_Object *obj,
-                                 const Dwg_DIMENSION_common *dim)
-{
-  double value;
-  const char *prefix = "";
-  const char *suffix = "";
-  char buf[128];
-
-  if (!dim)
-    return;
-  value = dim->act_measurement;
-  if (value != value)
-    return;
-
-  switch (obj->fixedtype)
-    {
-    case DWG_TYPE_DIMENSION_ANG3PT:
-    case DWG_TYPE_DIMENSION_ANG2LN:
-    case DWG_TYPE_ARC_DIMENSION:
-      value = value * 180.0 / DWG_PI;
-      suffix = "deg";
-      break;
-    case DWG_TYPE_DIMENSION_RADIUS:
-    case DWG_TYPE_LARGE_RADIAL_DIMENSION:
-      prefix = "R";
-      break;
-    case DWG_TYPE_DIMENSION_DIAMETER:
-      prefix = "D";
-      break;
-    default:
-      break;
-    }
-
-  snprintf (buf, sizeof (buf), "%s%.4f%s", prefix, value, suffix);
-  append_raw_text_to_layer (ctx, layer_name, buf);
-}
-
-static void
 append_dimension_text (TextExtractCtx *ctx, const char *layer_name,
                        const Dwg_Object *obj)
 {
@@ -627,8 +749,6 @@ append_dimension_text (TextExtractCtx *ctx, const char *layer_name,
       return;
     }
   free (raw);
-
-  append_generated_dimension_text (ctx, layer_name, obj, dim);
 }
 
 static void
@@ -1095,8 +1215,8 @@ build_output_json (DwgLayers *layers, char **out)
   return 0;
 }
 
-EXPORT int
-dwg_geojson_layers_text (char **cszTextOut, Dwg_Data *restrict dwg)
+int
+dwg_geojson_layers_text_impl (char **cszTextOut, Dwg_Data *restrict dwg)
 {
   TextExtractCtx ctx;
   int error;
@@ -1112,7 +1232,13 @@ dwg_geojson_layers_text (char **cszTextOut, Dwg_Data *restrict dwg)
       = (dwg->header.version >= R_2007 || dwg->header.from_version >= R_2007)
         && !(dwg->opts & DWG_OPTS_IN);
   ctx.free_table_names = IS_FROM_TU_DWG (dwg) ? 1 : 0;
+  ctx.trim_output_text = dwg->r2007_text_span_recovery_active ? 1 : 0;
   ctx.codepage = ctx.from_tu ? 0 : dwg->header.codepage;
+  {
+    const char *diag_path = getenv ("LIBDWG_GEOJSON_ENTITY_DIAG");
+    if (diag_path && diag_path[0])
+      ctx.diag = fopen (diag_path, "wb");
+  }
 
   ctx.object_seen
       = (unsigned char *)calloc (ctx.object_count ? ctx.object_count : 1,
@@ -1125,6 +1251,8 @@ dwg_geojson_layers_text (char **cszTextOut, Dwg_Data *restrict dwg)
                                  sizeof (*ctx.expanded_block_seen));
   if (!ctx.object_seen || !ctx.block_walked_seen || !ctx.expanded_block_seen)
     {
+      if (ctx.diag)
+        fclose (ctx.diag);
       free (ctx.object_seen);
       free (ctx.block_walked_seen);
       free (ctx.expanded_block_seen);
@@ -1133,12 +1261,15 @@ dwg_geojson_layers_text (char **cszTextOut, Dwg_Data *restrict dwg)
 
   add_layers_from_layer_control (&ctx);
   add_all_layer_objects (&ctx);
+  write_entity_diag (&ctx);
   walk_model_and_paper_space (&ctx);
   walk_unvisited_block_headers (&ctx);
   walk_unvisited_text_objects (&ctx);
 
   error = build_output_json (&ctx.layers, cszTextOut);
 
+  if (ctx.diag)
+    fclose (ctx.diag);
   free_all_layers (&ctx.layers);
   free (ctx.object_seen);
   free (ctx.block_walked_seen);
