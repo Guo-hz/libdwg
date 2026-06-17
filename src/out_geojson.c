@@ -2436,22 +2436,19 @@ geojson_entities_with_inserts_write(Bit_Chain *restrict dat, Dwg_Data *restrict 
 EXPORT int
 dwg_write_geojson(Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
 { 
-	if (!dwg->num_objects || !dat->fh)
+	char *json = NULL;
+	int error;
+
+	if (!dwg || !dwg->num_objects || !dat || !dat->fh)
 		return 1;
 
-	/*
-	 * 用户可修改此值来控制输出内容：
-	 *   leap = 1 → 输出所有文本信息
-	 *   leap = 2 → 输出所有文本信息和输出 INSERT / MINSERT 内部的文字
-	 */
-	int leap = 1;
+	error = dwg_geojson_layers_text(&json, dwg);
+	if (error || !json)
+		return 1;
 
-	if (leap == 1)
-		return geojson_entities_write(dat, dwg) ? 1 : 0;
-	else if (leap == 2)
-		return geojson_entities_with_inserts_write(dat, dwg) ? 1 : 0;
-	else
-		return 2;   // 未知模式，返回错误码
+	fputs(json, dat->fh);
+	free(json);
+	return ferror(dat->fh) ? 1 : 0;
 }
 
 //----------------------------------------------------------------------new2

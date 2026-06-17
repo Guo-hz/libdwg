@@ -1729,6 +1729,13 @@ dwg_free (Dwg_Data *dwg)
           FREE_IF (dwg->acis_sab_hdl[i]);
         }
       FREE_IF (dwg->acis_sab_hdl);
+      if (dwg->r2007_raw_texts.items)
+        {
+          for (i = 0; i < dwg->r2007_raw_texts.num_items; ++i)
+            FREE_IF (dwg->r2007_raw_texts.items[i].text);
+          FREE_IF (dwg->r2007_raw_texts.items);
+          memset (&dwg->r2007_raw_texts, 0, sizeof (dwg->r2007_raw_texts));
+        }
       FREE_IF (dwg->object);
       if (dwg->object_map)
         {

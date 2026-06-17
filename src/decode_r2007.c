@@ -31,6 +31,7 @@
 
 #include "common.h"
 #include "bits.h"
+#include "codepages.h"
 #include "decode.h"
 #include "dynapi.h"
 
@@ -100,9 +101,21 @@ static r2007_section *read_sections_map (Bit_Chain *dat, int64_t size_comp,
                                          int64_t size_uncomp,
                                          int64_t correction) ATTRIBUTE_MALLOC;
 static int read_data_section (Bit_Chain *sec_dat, Bit_Chain *dat,
+                              Dwg_Data *restrict dwg,
                               r2007_section *restrict sections_map,
                               r2007_page *restrict pages_map,
                               Dwg_Section_Type sec_type);
+static int scan_r2007_general_raw_strings (Dwg_Data *restrict dwg,
+                                           Bit_Chain *restrict sec_dat,
+                                           BITCODE_RLL address_base,
+                                           const char *label,
+                                           BITCODE_RLL layer_handle,
+                                           BITCODE_RLL object_handle,
+                                           BITCODE_BS object_type);
+static void r2007_dump_section_if_requested (const char *env_name,
+                                             const Bit_Chain *sec_dat);
+static void r2007_dump_numbered_section_if_requested (Dwg_Section_Type sec_type,
+                                                      const Bit_Chain *sec_dat);
 static int read_2007_section_classes (Bit_Chain *restrict dat,
                                       Dwg_Data *restrict dwg,
                                       r2007_section *restrict sections_map,
@@ -745,6 +758,7 @@ read_data_page (Bit_Chain *restrict dat, BITCODE_RC *restrict decomp,
 
 static int
 read_data_section (Bit_Chain *sec_dat, Bit_Chain *dat,
+                   Dwg_Data *restrict dwg,
                    r2007_section *restrict sections_map,
                    r2007_page *restrict pages_map, Dwg_Section_Type sec_type)
 {
@@ -855,7 +869,18 @@ read_data_section (Bit_Chain *sec_dat, Bit_Chain *dat,
         }
     }
   sec_dat->chain = decomp;
-  return 0;
+  r2007_dump_numbered_section_if_requested (sec_type, sec_dat);
+  if (dwg && sec_type != SECTION_OBJECTS && sec_type != SECTION_HANDLES
+      && sec_type != SECTION_PREVIEW && sec_type != SECTION_CLASSES
+      && sec_type != SECTION_HEADER)
+    {
+      char label[32];
+      snprintf (label, sizeof (label), "section_%u", (unsigned)sec_type);
+      error |= scan_r2007_general_raw_strings (
+          dwg, sec_dat, ((BITCODE_RLL)(unsigned)sec_type << 56), label, 0, 0,
+          0);
+    }
+  return error;
 }
 
 #define LOG_POS_DAT(dat)                                                      \
@@ -1067,6 +1092,49 @@ read_sections_map (Bit_Chain *dat, int64_t size_comp, int64_t size_uncomp,
 
   bit_chain_free (&page);
   return sections;
+}
+
+static void
+r2007_dump_section_if_requested (const char *env_name,
+                                 const Bit_Chain *sec_dat)
+{
+  const char *path;
+  FILE *fh;
+
+  if (!env_name || !sec_dat || !sec_dat->chain || !sec_dat->size)
+    return;
+  path = getenv (env_name);
+  if (!path || !path[0])
+    return;
+  fh = fopen (path, "wb");
+  if (!fh)
+    {
+      LOG_WARN ("Could not open %s dump path %s", env_name, path);
+      return;
+    }
+  fwrite (sec_dat->chain, 1, sec_dat->size, fh);
+  fclose (fh);
+  fprintf (stderr, "R2007 dumped %s to %s (%" PRIuSIZE " bytes)\n",
+           env_name, path, sec_dat->size);
+}
+
+static void
+r2007_dump_numbered_section_if_requested (Dwg_Section_Type sec_type,
+                                          const Bit_Chain *sec_dat)
+{
+  const char *dir = getenv ("LIBDWG_DUMP_R2007_SECTIONS");
+  char path[1024];
+  FILE *fh;
+
+  if (!dir || !dir[0] || !sec_dat || !sec_dat->chain || !sec_dat->size)
+    return;
+  snprintf (path, sizeof (path), "%s\\section_%u.bin", dir,
+            (unsigned)sec_type);
+  fh = fopen (path, "wb");
+  if (!fh)
+    return;
+  fwrite (sec_dat->chain, 1, sec_dat->size, fh);
+  fclose (fh);
 }
 
 static r2007_page *
@@ -1473,8 +1541,7 @@ read_2007_section_classes (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   int error;
   char c;
 
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_CLASSES);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_CLASSES);
   if (error)
     {
       LOG_ERROR ("Failed to read class section");
@@ -1600,8 +1667,7 @@ read_2007_section_header (Bit_Chain *restrict dat, Bit_Chain *restrict hdl_dat,
   Bit_Chain sec_dat = { 0 }, str_dat = { 0 };
   int error;
   LOG_TRACE ("\nSection Header\n-------------------\n");
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_HEADER);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_HEADER);
   if (error)
     {
       LOG_ERROR ("Failed to read header section");
@@ -1651,6 +1717,2934 @@ read_2007_section_header (Bit_Chain *restrict dat, Bit_Chain *restrict hdl_dat,
   return error;
 }
 
+typedef struct _r2007_handle_vec
+{
+  BITCODE_RLL *items;
+  size_t num;
+  size_t cap;
+} r2007_handle_vec;
+
+typedef struct _r2007_probe
+{
+  size_t address;
+  size_t body_address;
+  BITCODE_MS size;
+  BITCODE_BS type;
+  BITCODE_RL bitsize;
+  BITCODE_RLL handle;
+} r2007_probe;
+
+typedef struct _r2007_raw_scan_stats
+{
+  unsigned accepted;
+  unsigned s_eq;
+  unsigned cjk;
+  unsigned unassigned;
+  unsigned filtered;
+} r2007_raw_scan_stats;
+
+typedef struct _r2007_probe_vec
+{
+  r2007_probe *items;
+  size_t num;
+  size_t cap;
+} r2007_probe_vec;
+
+static int r2007_decode_recovery_probe (Dwg_Data *restrict dwg,
+                                        Bit_Chain *restrict obj_dat,
+                                        Bit_Chain *restrict hdl,
+                                        const r2007_probe *probe,
+                                        int *error);
+
+enum
+{
+  R2007_RAW_SRC_UTF16LE = 1,
+  R2007_RAW_SRC_UTF16BE,
+  R2007_RAW_SRC_ASCII,
+  R2007_RAW_SRC_CODEPAGE,
+  R2007_RAW_SRC_TU_PREFIX,
+  R2007_RAW_SRC_TV_PREFIX
+};
+
+static size_t r2007_find_bytes (const BITCODE_RC *haystack,
+                                size_t haystack_size,
+                                const BITCODE_RC *needle,
+                                size_t needle_size, size_t start);
+
+static void
+r2007_handle_vec_free (r2007_handle_vec *vec)
+{
+  free (vec->items);
+  memset (vec, 0, sizeof (*vec));
+}
+
+static int
+r2007_handle_vec_contains (const r2007_handle_vec *vec, BITCODE_RLL handle)
+{
+  size_t i;
+  for (i = 0; i < vec->num; i++)
+    if (vec->items[i] == handle)
+      return 1;
+  return 0;
+}
+
+static int
+r2007_handle_vec_add (r2007_handle_vec *vec, BITCODE_RLL handle)
+{
+  if (!handle || r2007_handle_vec_contains (vec, handle))
+    return 0;
+  if (vec->num == vec->cap)
+    {
+      size_t new_cap = vec->cap ? vec->cap * 2 : 64;
+      BITCODE_RLL *items = (BITCODE_RLL *)realloc (
+          vec->items, new_cap * sizeof (BITCODE_RLL));
+      if (!items)
+        return DWG_ERR_OUTOFMEM;
+      vec->items = items;
+      vec->cap = new_cap;
+    }
+  vec->items[vec->num++] = handle;
+  return 0;
+}
+
+static void
+r2007_probe_vec_free (r2007_probe_vec *vec)
+{
+  free (vec->items);
+  memset (vec, 0, sizeof (*vec));
+}
+
+static int
+r2007_probe_vec_add (r2007_probe_vec *vec, const r2007_probe *probe)
+{
+  if (!probe)
+    return 0;
+  if (vec->num == vec->cap)
+    {
+      size_t new_cap = vec->cap ? vec->cap * 2 : 4096;
+      r2007_probe *items = (r2007_probe *)realloc (
+          vec->items, new_cap * sizeof (*items));
+      if (!items)
+        return DWG_ERR_OUTOFMEM;
+      vec->items = items;
+      vec->cap = new_cap;
+    }
+  vec->items[vec->num++] = *probe;
+  return 0;
+}
+
+static int
+r2007_ref_abs (const Dwg_Object_Ref *ref, BITCODE_RLL *absref)
+{
+  if (!ref || !absref)
+    return 0;
+  *absref = ref->absolute_ref ? ref->absolute_ref : ref->handleref.value;
+  return *absref != 0;
+}
+
+static int
+r2007_object_has_handle (const Dwg_Data *dwg, BITCODE_RLL handle)
+{
+  Dwg_Object *obj = handle ? dwg_resolve_handle_silent (dwg, handle) : NULL;
+  return obj != NULL;
+}
+
+static int
+r2007_collect_unresolved_layer_handles (Dwg_Data *restrict dwg,
+                                        r2007_handle_vec *restrict targets)
+{
+  Dwg_Object *ctrl = dwg_get_first_object (dwg, DWG_TYPE_LAYER_CONTROL);
+  BITCODE_RLL absref;
+  int error = 0;
+
+  if (ctrl && ctrl->tio.object && ctrl->tio.object->tio.LAYER_CONTROL)
+    {
+      Dwg_Object_LAYER_CONTROL *layer_ctrl
+          = ctrl->tio.object->tio.LAYER_CONTROL;
+      BITCODE_BS i;
+      for (i = 0; layer_ctrl->entries && i < layer_ctrl->num_entries; i++)
+        {
+          if (r2007_ref_abs (layer_ctrl->entries[i], &absref)
+              && !r2007_object_has_handle (dwg, absref))
+            error |= r2007_handle_vec_add (targets, absref);
+        }
+    }
+
+  if (r2007_ref_abs (dwg->header_vars.CLAYER, &absref)
+      && !r2007_object_has_handle (dwg, absref))
+    error |= r2007_handle_vec_add (targets, absref);
+
+  for (BITCODE_BL i = 0; i < dwg->num_objects; i++)
+    {
+      Dwg_Object *obj = &dwg->object[i];
+      if (obj->supertype == DWG_SUPERTYPE_ENTITY && obj->tio.entity
+          && r2007_ref_abs (obj->tio.entity->layer, &absref)
+          && !r2007_object_has_handle (dwg, absref))
+        error |= r2007_handle_vec_add (targets, absref);
+    }
+
+  return error;
+}
+
+static int
+r2007_collect_all_layer_handles (Dwg_Data *restrict dwg,
+                                 r2007_handle_vec *restrict targets)
+{
+  Dwg_Object *ctrl = dwg_get_first_object (dwg, DWG_TYPE_LAYER_CONTROL);
+  BITCODE_RLL absref;
+  int error = 0;
+
+  if (ctrl && ctrl->tio.object && ctrl->tio.object->tio.LAYER_CONTROL)
+    {
+      Dwg_Object_LAYER_CONTROL *layer_ctrl
+          = ctrl->tio.object->tio.LAYER_CONTROL;
+      BITCODE_BS i;
+      for (i = 0; layer_ctrl->entries && i < layer_ctrl->num_entries; i++)
+        {
+          if (r2007_ref_abs (layer_ctrl->entries[i], &absref))
+            error |= r2007_handle_vec_add (targets, absref);
+        }
+    }
+
+  if (r2007_ref_abs (dwg->header_vars.CLAYER, &absref))
+    error |= r2007_handle_vec_add (targets, absref);
+
+  return error;
+}
+
+static int
+r2007_utf8_has_cjk (const char *text)
+{
+  const unsigned char *p = (const unsigned char *)text;
+
+  if (!p)
+    return 0;
+  while (*p)
+    {
+      unsigned cp;
+      if (*p < 0x80)
+        {
+          p++;
+          continue;
+        }
+      if ((*p & 0xe0) == 0xc0 && p[1])
+        {
+          cp = ((unsigned)(p[0] & 0x1f) << 6) | (unsigned)(p[1] & 0x3f);
+          p += 2;
+        }
+      else if ((*p & 0xf0) == 0xe0 && p[1] && p[2])
+        {
+          cp = ((unsigned)(p[0] & 0x0f) << 12)
+               | ((unsigned)(p[1] & 0x3f) << 6)
+               | (unsigned)(p[2] & 0x3f);
+          p += 3;
+        }
+      else if ((*p & 0xf8) == 0xf0 && p[1] && p[2] && p[3])
+        {
+          cp = ((unsigned)(p[0] & 0x07) << 18)
+               | ((unsigned)(p[1] & 0x3f) << 12)
+               | ((unsigned)(p[2] & 0x3f) << 6)
+               | (unsigned)(p[3] & 0x3f);
+          p += 4;
+        }
+      else
+        {
+          p++;
+          continue;
+        }
+      if ((cp >= 0x3400 && cp <= 0x9fff)
+          || (cp >= 0xf900 && cp <= 0xfaff))
+        return 1;
+    }
+  return 0;
+}
+
+static char *
+r2007_text_to_utf8_alloc (Dwg_Data *restrict dwg, BITCODE_T value)
+{
+  char *utf8;
+
+  if (!value)
+    return NULL;
+  if (dwg && (dwg->header.version >= R_2007
+              || dwg->header.from_version >= R_2007)
+      && !(dwg->opts & DWG_OPTS_IN))
+    return bit_convert_TU ((BITCODE_TU)value);
+  utf8 = bit_TV_to_utf8 ((char *)value,
+                         dwg ? dwg->header.codepage : 30);
+  if (utf8 && utf8 != (char *)value)
+    return utf8;
+  return strdup ((char *)value);
+}
+
+static int
+r2007_collect_cjk_layer_handles (Dwg_Data *restrict dwg,
+                                 const r2007_handle_vec *source,
+                                 r2007_handle_vec *restrict targets)
+{
+  int error = 0;
+
+  if (!source || !targets)
+    return 0;
+  for (size_t i = 0; i < source->num; i++)
+    {
+      Dwg_Object *obj = dwg_resolve_handle_silent (dwg, source->items[i]);
+      Dwg_Object_LAYER *layer;
+      char *name;
+
+      if (!obj || obj->fixedtype != DWG_TYPE_LAYER || !obj->tio.object
+          || !obj->tio.object->tio.LAYER)
+        continue;
+      layer = obj->tio.object->tio.LAYER;
+      name = r2007_text_to_utf8_alloc (dwg, layer->name);
+      if (name && r2007_utf8_has_cjk (name))
+        error |= r2007_handle_vec_add (targets, source->items[i]);
+      free (name);
+    }
+  return error;
+}
+
+static int
+r2007_fixed_type_may_have_text (BITCODE_BS type)
+{
+  switch (type)
+    {
+    case DWG_TYPE_TEXT:
+    case DWG_TYPE_ATTRIB:
+    case DWG_TYPE_ATTDEF:
+    case DWG_TYPE_MTEXT:
+    case DWG_TYPE_LEADER:
+    case DWG_TYPE_TOLERANCE:
+    case DWG_TYPE_DIMENSION_ORDINATE:
+    case DWG_TYPE_DIMENSION_LINEAR:
+    case DWG_TYPE_DIMENSION_ALIGNED:
+    case DWG_TYPE_DIMENSION_ANG3PT:
+    case DWG_TYPE_DIMENSION_ANG2LN:
+    case DWG_TYPE_DIMENSION_RADIUS:
+    case DWG_TYPE_DIMENSION_DIAMETER:
+    case DWG_TYPE_ARC_DIMENSION:
+    case DWG_TYPE_LARGE_RADIAL_DIMENSION:
+    case DWG_TYPE_TABLE:
+    case DWG_TYPE_MULTILEADER:
+    case DWG_TYPE_GEOPOSITIONMARKER:
+    case DWG_TYPE_ARCALIGNEDTEXT:
+    case DWG_TYPE_RTEXT:
+      return 1;
+    default:
+      return 0;
+    }
+}
+
+static int
+r2007_fixed_type_may_have_layer_name_text (BITCODE_BS type)
+{
+  switch (type)
+    {
+    case DWG_TYPE_LWPOLYLINE:
+    case DWG_TYPE_POLYLINE_2D:
+    case DWG_TYPE_POLYLINE_3D:
+    case DWG_TYPE_POLYLINE_PFACE:
+    case DWG_TYPE_REGION:
+      return 1;
+    default:
+      return 0;
+    }
+}
+
+static int
+r2007_class_name_may_have_text (const Dwg_Data *dwg, BITCODE_BS type)
+{
+  Dwg_Class *klass;
+  const char *name;
+  int i;
+
+  if (type < 500)
+    return 0;
+  i = type - 500;
+  if (i < 0 || i >= (int)dwg->num_classes)
+    return 0;
+  klass = &dwg->dwg_class[i];
+  name = klass->dxfname ? klass->dxfname : klass->cppname;
+  if (!name)
+    return 0;
+  return strstr (name, "TEXT") || strstr (name, "Text")
+         || strstr (name, "LABEL") || strstr (name, "Label")
+         || strstr (name, "DIMENSION") || strstr (name, "Dimension")
+         || strstr (name, "LEADER") || strstr (name, "Leader")
+         || strstr (name, "TABLE") || strstr (name, "Table");
+}
+
+static int
+r2007_probe_type_is_candidate (const Dwg_Data *dwg, BITCODE_BS type)
+{
+  return type == DWG_TYPE_LAYER || r2007_fixed_type_may_have_text (type)
+         || r2007_class_name_may_have_text (dwg, type)
+         || type == DWG_TYPE_PROXY_ENTITY || type == DWG_TYPE_PROXY_OBJECT
+         || type == DWG_TYPE_UNKNOWN_ENT || type == DWG_TYPE_UNKNOWN_OBJ;
+}
+
+static int
+r2007_probe_type_is_plausible (const Dwg_Data *dwg, BITCODE_BS type)
+{
+  if (type > 0 && type <= DWG_TYPE_LAYOUT)
+    return 1;
+  if (type == DWG_TYPE_PROXY_ENTITY || type == DWG_TYPE_PROXY_OBJECT)
+    return 1;
+  if (type == DWG_TYPE_UNKNOWN_ENT || type == DWG_TYPE_UNKNOWN_OBJ)
+    return 1;
+  if (type >= 500 && type - 500 < dwg->num_classes)
+    return 1;
+  return 0;
+}
+
+static BITCODE_MS
+r2007_read_ms_at (const BITCODE_RC *chain, size_t size, size_t address,
+                  size_t *body_address)
+{
+  BITCODE_RS lo;
+  BITCODE_RS hi;
+
+  if (address + 2 > size)
+    return 0;
+  lo = (BITCODE_RS)(chain[address] | (chain[address + 1] << 8));
+  if (!(lo & 0x8000))
+    {
+      *body_address = address + 2;
+      return lo;
+    }
+  if (address + 4 > size)
+    return 0;
+  hi = (BITCODE_RS)(chain[address + 2] | (chain[address + 3] << 8));
+  if (hi & 0x8000)
+    return 0;
+  *body_address = address + 4;
+  return (BITCODE_MS)((lo & 0x7fff) | ((BITCODE_MS)hi << 15));
+}
+
+static int
+r2007_probe_object (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                    size_t address, r2007_probe *restrict probe)
+{
+  Bit_Chain dat;
+  Dwg_Handle handle = { 0 };
+  size_t body_address = 0;
+  size_t end_address;
+  BITCODE_MS size;
+  BITCODE_BS type;
+  BITCODE_RL bitsize;
+
+  if (address + 12 >= obj_dat->size)
+    return 0;
+
+  size = r2007_read_ms_at (obj_dat->chain, obj_dat->size, address,
+                           &body_address);
+  if (size < 10 || body_address + size + 2 > obj_dat->size)
+    return 0;
+
+  end_address = body_address + size;
+  if (end_address <= address + 2)
+    return 0;
+
+  dat = *obj_dat;
+  dat.byte = body_address;
+  dat.bit = 0;
+  bit_reset_chain (&dat);
+  dat.size = size;
+  type = bit_read_BS (&dat);
+  if (!r2007_probe_type_is_plausible (dwg, type))
+    return 0;
+
+  bitsize = bit_read_RL (&dat);
+  if (bitsize > size * 8 || bitsize < bit_position (&dat))
+    return 0;
+
+  if (bit_read_H (&dat, &handle) || !handle.value || !handle.size)
+    return 0;
+
+  probe->address = address;
+  probe->body_address = body_address;
+  probe->size = size;
+  probe->type = type;
+  probe->bitsize = bitsize;
+  probe->handle = handle.value;
+  return 1;
+}
+
+static int
+r2007_build_probe_index (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                         r2007_probe_vec *restrict probes)
+{
+  int error = 0;
+
+  if (!obj_dat || !obj_dat->chain)
+    return 0;
+  for (size_t address = 0; address + 12 < obj_dat->size; address++)
+    {
+      r2007_probe probe;
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      if (!r2007_probe_type_is_candidate (dwg, probe.type)
+          && probe.type != DWG_TYPE_PROXY_ENTITY
+          && probe.type != DWG_TYPE_PROXY_OBJECT)
+        continue;
+      error |= r2007_probe_vec_add (probes, &probe);
+    }
+  return error;
+}
+
+static const r2007_probe *
+r2007_probe_index_find (const r2007_probe_vec *probes, size_t pos)
+{
+  size_t lo = 0;
+  size_t hi;
+
+  if (!probes || !probes->num)
+    return NULL;
+  hi = probes->num;
+  while (lo < hi)
+    {
+      size_t mid = lo + (hi - lo) / 2;
+      if (probes->items[mid].body_address <= pos)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+  while (lo > 0)
+    {
+      const r2007_probe *probe = &probes->items[--lo];
+      if (pos >= probe->body_address && pos < probe->body_address + probe->size)
+        return probe;
+      if (probe->body_address + probe->size <= pos)
+        break;
+    }
+  return NULL;
+}
+
+static int
+r2007_raw_text_seen (const Dwg_Data *dwg, BITCODE_RLL object_handle,
+                     BITCODE_RLL address, BITCODE_RC source)
+{
+  for (BITCODE_BL i = 0; i < dwg->r2007_raw_texts.num_items; i++)
+    if (dwg->r2007_raw_texts.items[i].address == address
+        && dwg->r2007_raw_texts.items[i].object_handle == object_handle
+        && dwg->r2007_raw_texts.items[i].source == source)
+      return 1;
+  return 0;
+}
+
+static char *r2007_normalize_s_eq_text (char *text);
+
+static int
+r2007_raw_text_append (Dwg_Data *restrict dwg, char *text,
+                       BITCODE_RLL layer_handle, BITCODE_RLL object_handle,
+                       BITCODE_RLL address, BITCODE_BS object_type,
+                       BITCODE_RC source, r2007_raw_scan_stats *stats)
+{
+  Dwg_RawTextRecovery *raw = &dwg->r2007_raw_texts;
+  Dwg_RawTextRecoveryItem *items;
+
+  if (!text || !text[0])
+    {
+      free (text);
+      return 0;
+    }
+  if (strstr (text, "S="))
+    {
+      text = r2007_normalize_s_eq_text (text);
+      if (!text || !text[0])
+        {
+          free (text);
+          if (stats)
+            stats->filtered++;
+          dwg->r2007_raw_texts.raw_filtered_count++;
+          return 0;
+        }
+    }
+  if (r2007_raw_text_seen (dwg, object_handle, address, source))
+    {
+      free (text);
+      return 0;
+    }
+  if (raw->num_items == raw->capacity)
+    {
+      BITCODE_BL new_cap = raw->capacity ? raw->capacity * 2 : 1024;
+      items = (Dwg_RawTextRecoveryItem *)realloc (
+          raw->items, (size_t)new_cap * sizeof (*items));
+      if (!items)
+        {
+          free (text);
+          return DWG_ERR_OUTOFMEM;
+        }
+      raw->items = items;
+      raw->capacity = new_cap;
+    }
+  raw->items[raw->num_items].text = text;
+  raw->items[raw->num_items].layer_handle = layer_handle;
+  raw->items[raw->num_items].object_handle = object_handle;
+  raw->items[raw->num_items].address = address;
+  raw->items[raw->num_items].object_type = object_type;
+  raw->items[raw->num_items].source = source;
+  raw->num_items++;
+  raw->raw_s_eq_count += strstr (text, "S=") ? 1 : 0;
+  if (!layer_handle)
+    raw->raw_unassigned_count++;
+  if (stats)
+    {
+      stats->accepted++;
+      if (strstr (text, "S="))
+        stats->s_eq++;
+      if (!layer_handle)
+        stats->unassigned++;
+    }
+  return 0;
+}
+
+static char *
+r2007_normalize_s_eq_text (char *text)
+{
+  char *s;
+  char *num;
+  char *end;
+  char *orig = text;
+  char *copy_start;
+  int seen_digit = 0;
+  int seen_dot = 0;
+  int digits_before_dot = 0;
+  int digits_after_dot = 0;
+  int keep_prefix = 0;
+  size_t len;
+  char *out;
+
+  if (!text)
+    return NULL;
+  s = strstr (text, "S=");
+  if (!s)
+    return text;
+  num = s + 2;
+  if (*num < '0' || *num > '9')
+    {
+      free (text);
+      return NULL;
+    }
+  for (char *p = text; p < s; p++)
+    if (((unsigned char)*p) >= 0x80)
+      {
+        keep_prefix = 1;
+        break;
+      }
+  end = num;
+  while (*end)
+    {
+      if (*end >= '0' && *end <= '9')
+        {
+          seen_digit = 1;
+          if (seen_dot)
+            digits_after_dot++;
+          else
+            digits_before_dot++;
+          end++;
+          continue;
+        }
+      if (*end == '.' && !seen_dot)
+        {
+          seen_dot = 1;
+          end++;
+          continue;
+        }
+      break;
+    }
+  if (!seen_digit)
+    {
+      free (text);
+      return NULL;
+    }
+  if (end > num && end[-1] == '.')
+    end--;
+  if (digits_before_dot + digits_after_dot < 2
+      || (seen_dot && digits_after_dot == 0))
+    {
+      free (text);
+      return NULL;
+    }
+  copy_start = keep_prefix ? orig : s;
+  len = (size_t)(end - copy_start);
+  out = (char *)malloc (len + 1);
+  if (!out)
+    {
+      free (orig);
+      return NULL;
+    }
+  memcpy (out, copy_start, len);
+  out[len] = '\0';
+  free (orig);
+  return out;
+}
+
+static const char *
+r2007_raw_source_name (BITCODE_RC source)
+{
+  switch (source)
+    {
+    case R2007_RAW_SRC_UTF16LE:
+      return "utf16le";
+    case R2007_RAW_SRC_UTF16BE:
+      return "utf16be";
+    case R2007_RAW_SRC_ASCII:
+      return "ascii";
+    case R2007_RAW_SRC_CODEPAGE:
+      return "codepage";
+    case R2007_RAW_SRC_TU_PREFIX:
+      return "tu_prefix";
+    case R2007_RAW_SRC_TV_PREFIX:
+      return "tv_prefix";
+    default:
+      return "unknown";
+    }
+}
+
+static void
+r2007_dump_raw_texts_if_requested (const Dwg_Data *dwg)
+{
+  const char *path = getenv ("LIBDWG_DUMP_R2007_RAW_TEXTS");
+  FILE *fp;
+
+  if (!path || !path[0] || !dwg)
+    return;
+  fp = fopen (path, "wb");
+  if (!fp)
+    {
+      fprintf (stderr, "R2007 raw text dump failed: %s\n", path);
+      return;
+    }
+  fprintf (fp, "address\tobject_handle\tlayer_handle\tobject_type\tsource\ttext\n");
+  for (BITCODE_BL i = 0; i < dwg->r2007_raw_texts.num_items; i++)
+    {
+      const Dwg_RawTextRecoveryItem *item = &dwg->r2007_raw_texts.items[i];
+      fprintf (fp, FORMAT_HV "\t" FORMAT_HV "\t" FORMAT_HV
+               "\t%u\t%s\t%s\n",
+               item->address, item->object_handle, item->layer_handle,
+               (unsigned)item->object_type,
+               r2007_raw_source_name (item->source),
+               item->text ? item->text : "");
+    }
+  fclose (fp);
+}
+
+static int
+r2007_utf16_codepoint_is_text (uint16_t c)
+{
+  if (c >= 0x20 && c <= 0x7e)
+    return 1;
+  if (c >= 0x3400 && c <= 0x9fff)
+    return 1;
+  if (c >= 0xf900 && c <= 0xfaff)
+    return 1;
+  if (c >= 0x3000 && c <= 0x303f)
+    return 1;
+  if (c >= 0xff00 && c <= 0xffef)
+    return 1;
+  return 0;
+}
+
+static int
+r2007_utf16_codepoint_is_cjk (uint16_t c)
+{
+  return (c >= 0x3400 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff);
+}
+
+static int
+r2007_ascii_text_is_worthkeeping (const char *text, size_t len)
+{
+  int has_digit = 0;
+  int has_alpha = 0;
+  int dot_count = 0;
+
+  if (!text || len < 2)
+    return 0;
+  if (strncmp (text, "S=", 2) == 0)
+    {
+      const char *s = text + 2;
+      if (*s < '0' || *s > '9')
+        return 0;
+      while (*s)
+        {
+          if (*s >= '0' && *s <= '9')
+            has_digit = 1;
+          else if (*s == '.' && dot_count++ == 0)
+            ;
+          else
+            return 0;
+          s++;
+        }
+      return has_digit;
+    }
+  for (const char *p = text; *p; p++)
+    {
+      if (*p >= '0' && *p <= '9')
+        has_digit = 1;
+      else if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))
+        has_alpha = 1;
+      else if (*p == '.' && !has_alpha && dot_count++ == 0)
+        ;
+      else
+        return 0;
+    }
+  return (has_alpha && has_digit)
+         || (!has_alpha && has_digit && dot_count == 1);
+}
+
+static int
+r2007_utf8_text_is_useful (const char *s)
+{
+  int has_cjk = 0;
+  int has_s_eq = 0;
+  int has_digit = 0;
+  int has_alpha = 0;
+
+  if (!s || !s[0] || !s[1])
+    return 0;
+  has_s_eq = strstr (s, "S=") != NULL;
+  for (const unsigned char *p = (const unsigned char *)s; *p;)
+    {
+      if (*p >= '0' && *p <= '9')
+        {
+          has_digit = 1;
+          p++;
+        }
+      else if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z'))
+        {
+          has_alpha = 1;
+          p++;
+        }
+      else if (*p >= 0xe0 && (*p & 0xf0) == 0xe0 && p[1] && p[2]
+               && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80)
+        {
+          unsigned cp = ((*p & 0x0f) << 12) | ((p[1] & 0x3f) << 6)
+                        | (p[2] & 0x3f);
+          if ((cp >= 0x3400 && cp <= 0x9fff)
+              || (cp >= 0xf900 && cp <= 0xfaff))
+            has_cjk = 1;
+          p += 3;
+        }
+      else if (*p >= 0xc0 && (*p & 0xe0) == 0xc0 && p[1]
+               && (p[1] & 0xc0) == 0x80)
+        p += 2;
+      else if (*p >= 0xf0 && (*p & 0xf8) == 0xf0 && p[1] && p[2] && p[3]
+               && (p[1] & 0xc0) == 0x80 && (p[2] & 0xc0) == 0x80
+               && (p[3] & 0xc0) == 0x80)
+        p += 4;
+      else
+        p++;
+    }
+  return has_cjk || has_s_eq || (has_alpha && has_digit);
+}
+
+static int
+r2007_raw_codepage_byte_is_text (BITCODE_RC c)
+{
+  return (c >= 0x20 && c <= 0x7e) || c >= 0x80;
+}
+
+static int
+r2007_scan_codepage_raw_strings (Dwg_Data *restrict dwg,
+                                 Bit_Chain *restrict sec_dat,
+                                 BITCODE_RLL address_base,
+                                 BITCODE_RLL layer_handle,
+                                 BITCODE_RLL object_handle,
+                                 BITCODE_BS object_type,
+                                 r2007_raw_scan_stats *stats)
+{
+  int error = 0;
+
+  if (!dwg || !sec_dat || !sec_dat->chain || !sec_dat->size)
+    return 0;
+  if (dwg->header.codepage == CP_UTF16)
+    return 0;
+
+  for (size_t i = 0; i < sec_dat->size;)
+    {
+      size_t start = i;
+      int has_high = 0;
+      while (i < sec_dat->size && r2007_raw_codepage_byte_is_text (
+                                       sec_dat->chain[i]))
+        {
+          if (sec_dat->chain[i] >= 0x80)
+            has_high = 1;
+          i++;
+          if (i - start >= 64)
+            break;
+        }
+      if (i > start)
+        {
+          size_t len = i - start;
+          if (has_high && len >= 2 && len <= 64)
+            {
+              char *raw = (char *)malloc (len + 1);
+              char *utf8;
+              if (!raw)
+                return DWG_ERR_OUTOFMEM;
+              memcpy (raw, &sec_dat->chain[start], len);
+              raw[len] = '\0';
+              utf8 = bit_TV_to_utf8 (raw, dwg->header.codepage);
+              if (utf8 && r2007_utf8_text_is_useful (utf8))
+                {
+                  error |= r2007_raw_text_append (
+                      dwg, utf8, layer_handle, object_handle,
+                      address_base + (BITCODE_RLL)start, object_type,
+                      R2007_RAW_SRC_CODEPAGE, stats);
+                  if (utf8 != raw)
+                    free (raw);
+                }
+              else
+                {
+                  if (utf8 && utf8 != raw)
+                    free (utf8);
+                  free (raw);
+                  if (stats)
+                    stats->filtered++;
+                  dwg->r2007_raw_texts.raw_filtered_count++;
+                }
+            }
+        }
+      else
+        i++;
+    }
+  return error;
+}
+
+static int
+r2007_utf16_text_is_worthkeeping (const BITCODE_RC *src, size_t chars,
+                                  int *has_cjk, int *has_s_eq)
+{
+  int cjk = 0;
+  int s_eq = 0;
+  size_t swapped_ascii = 0;
+
+  if (!src || chars < 2)
+    return 0;
+  for (size_t i = 0; i < chars; i++)
+    {
+      uint16_t c = (uint16_t)(src[i * 2] | (src[i * 2 + 1] << 8));
+      if ((c & 0x00ff) == 0 && (c >> 8) >= 0x20 && (c >> 8) <= 0x7e)
+        swapped_ascii++;
+      if (r2007_utf16_codepoint_is_cjk (c))
+        cjk = 1;
+      if (i + 1 < chars)
+        {
+          uint16_t n = (uint16_t)(src[i * 2 + 2] | (src[i * 2 + 3] << 8));
+          if (c == 'S' && n == '=')
+            s_eq = 1;
+        }
+    }
+  if (has_cjk)
+    *has_cjk = cjk;
+  if (has_s_eq)
+    *has_s_eq = s_eq;
+  if (!s_eq && swapped_ascii > chars / 2)
+    return 0;
+  return cjk || s_eq;
+}
+
+static Dwg_Object *
+r2007_find_decoded_object_for_probe (Dwg_Data *restrict dwg,
+                                     const r2007_probe *probe)
+{
+  return probe && probe->handle ? dwg_resolve_handle_silent (dwg, probe->handle)
+                                : NULL;
+}
+
+static BITCODE_RLL
+r2007_layer_handle_for_probe (Dwg_Data *restrict dwg,
+                              const r2007_probe *probe)
+{
+  Dwg_Object *obj = r2007_find_decoded_object_for_probe (dwg, probe);
+  Dwg_Object_Ref *layer;
+
+  if (!obj || obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+    return 0;
+  layer = obj->tio.entity->layer;
+  if (!layer)
+    return 0;
+  return layer->absolute_ref ? layer->absolute_ref : layer->handleref.value;
+}
+
+static BITCODE_RLL
+r2007_layer_handle_for_decoded_object (const Dwg_Object *obj)
+{
+  Dwg_Object_Ref *layer;
+
+  if (!obj || obj->supertype != DWG_SUPERTYPE_ENTITY || !obj->tio.entity)
+    return 0;
+  layer = obj->tio.entity->layer;
+  if (!layer)
+    return 0;
+  return layer->absolute_ref ? layer->absolute_ref : layer->handleref.value;
+}
+
+static void
+r2007_raw_context_for_pos (Dwg_Data *restrict dwg,
+                           Bit_Chain *restrict obj_dat,
+                           Bit_Chain *restrict hdl,
+                           const r2007_probe_vec *probes, size_t pos,
+                           r2007_handle_vec *decoded_raw_probes,
+                           BITCODE_RLL *layer_handle,
+                           BITCODE_RLL *object_handle,
+                           BITCODE_BS *object_type,
+                           unsigned *context_hits,
+                           unsigned *decoded_hits, int *error)
+{
+  const r2007_probe *probe;
+
+  if (layer_handle)
+    *layer_handle = 0;
+  if (object_handle)
+    *object_handle = 0;
+  if (object_type)
+    *object_type = 0;
+  if (!probes || !probes->num)
+    return;
+
+  probe = r2007_probe_index_find (probes, pos);
+  if (!probe)
+    return;
+
+  if (object_handle)
+    *object_handle = probe->handle;
+  if (object_type)
+    *object_type = probe->type;
+  if (context_hits)
+    (*context_hits)++;
+
+  if (layer_handle)
+    *layer_handle = r2007_layer_handle_for_probe (dwg, probe);
+
+  if (hdl && !r2007_object_has_handle (dwg, probe->handle)
+      && (r2007_fixed_type_may_have_text (probe->type)
+          || r2007_class_name_may_have_text (dwg, probe->type)
+          || probe->type == DWG_TYPE_PROXY_ENTITY
+          || probe->type == DWG_TYPE_PROXY_OBJECT
+          || probe->type == DWG_TYPE_UNKNOWN_ENT
+          || probe->type == DWG_TYPE_UNKNOWN_OBJ)
+      && (!decoded_raw_probes
+          || !r2007_handle_vec_contains (decoded_raw_probes, probe->handle)))
+    {
+      int local_error = 0;
+      int decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl, probe,
+                                                 &local_error);
+      if (error)
+        *error |= local_error;
+      if (decoded_raw_probes)
+        {
+          int vec_error = r2007_handle_vec_add (decoded_raw_probes,
+                                                probe->handle);
+          if (error)
+            *error |= vec_error;
+        }
+      if (decoded > 0 && decoded_hits)
+        (*decoded_hits)++;
+      if (layer_handle && !*layer_handle)
+        *layer_handle = r2007_layer_handle_for_probe (dwg, probe);
+    }
+}
+
+static int
+r2007_text_value_is_suspicious (Dwg_Data *restrict dwg, BITCODE_T value)
+{
+  char *utf8 = NULL;
+  const char *s;
+  int useful = 0;
+  int punctuation = 0;
+
+  if (!value)
+    return 1;
+
+  if (dwg && (dwg->header.version >= R_2007
+              || dwg->header.from_version >= R_2007)
+      && !(dwg->opts & DWG_OPTS_IN))
+    {
+      utf8 = bit_convert_TU ((BITCODE_TU)value);
+      s = utf8;
+    }
+  else
+    s = (const char *)value;
+
+  if (!s || !s[0])
+    {
+      free (utf8);
+      return 1;
+    }
+
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+    {
+      if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        continue;
+      if (*p == ',' || *p == '.' || *p == ';' || *p == ':' || *p == '?'
+          || *p == '!' || *p == '<' || *p == '>')
+        {
+          punctuation++;
+          continue;
+        }
+      useful = 1;
+      break;
+    }
+
+  free (utf8);
+  return !useful && punctuation <= 2;
+}
+
+static int
+r2007_decoded_text_object_needs_raw_scan (Dwg_Data *restrict dwg,
+                                          const Dwg_Object *obj)
+{
+  int type;
+
+  if (!obj || !obj->tio.entity)
+    return 0;
+  if (obj->size > 512)
+    return 0;
+
+  type = obj->fixedtype ? obj->fixedtype : obj->type;
+  switch (type)
+    {
+    case DWG_TYPE_TEXT:
+      return obj->tio.entity->tio.TEXT
+             && r2007_text_value_is_suspicious (
+                 dwg, obj->tio.entity->tio.TEXT->text_value);
+    case DWG_TYPE_MTEXT:
+      return obj->tio.entity->tio.MTEXT
+             && r2007_text_value_is_suspicious (
+                 dwg, obj->tio.entity->tio.MTEXT->text);
+    case DWG_TYPE_ATTRIB:
+      return obj->tio.entity->tio.ATTRIB
+             && r2007_text_value_is_suspicious (
+                 dwg, obj->tio.entity->tio.ATTRIB->text_value);
+    case DWG_TYPE_ATTDEF:
+      return obj->tio.entity->tio.ATTDEF
+             && r2007_text_value_is_suspicious (
+                 dwg, obj->tio.entity->tio.ATTDEF->default_value);
+    default:
+      return 0;
+    }
+}
+
+static int
+r2007_find_containing_probe (Dwg_Data *restrict dwg,
+                             Bit_Chain *restrict obj_dat, size_t pos,
+                             r2007_probe *restrict out)
+{
+  const size_t back_limit = 2048;
+  size_t start = pos > back_limit ? pos - back_limit : 0;
+
+  for (size_t address = pos;; address--)
+    {
+      r2007_probe probe;
+      if (r2007_probe_object (dwg, obj_dat, address, &probe)
+          && pos >= probe.body_address && pos < probe.body_address + probe.size)
+        {
+          if (out)
+            *out = probe;
+          return 1;
+        }
+      if (address == start)
+        break;
+    }
+  return 0;
+}
+
+static char *
+r2007_copy_ascii_raw_text (const BITCODE_RC *src, size_t len)
+{
+  char *out = (char *)malloc (len + 1);
+  if (!out)
+    return NULL;
+  memcpy (out, src, len);
+  out[len] = '\0';
+  return out;
+}
+
+static char *
+r2007_convert_utf16_raw_text (const BITCODE_RC *src, size_t chars)
+{
+  BITCODE_RC *tmp = (BITCODE_RC *)calloc (chars + 1, 2);
+  char *out;
+
+  if (!tmp)
+    return NULL;
+  memcpy (tmp, src, chars * 2);
+  out = bit_convert_TU ((BITCODE_TU)tmp);
+  free (tmp);
+  return out;
+}
+
+static char *
+r2007_convert_utf16be_raw_text (const BITCODE_RC *src, size_t chars)
+{
+  BITCODE_RC *tmp = (BITCODE_RC *)calloc (chars + 1, 2);
+  char *out;
+
+  if (!tmp)
+    return NULL;
+  for (size_t i = 0; i < chars; i++)
+    {
+      tmp[i * 2] = src[i * 2 + 1];
+      tmp[i * 2 + 1] = src[i * 2];
+    }
+  out = bit_convert_TU ((BITCODE_TU)tmp);
+  free (tmp);
+  return out;
+}
+
+static size_t
+r2007_utf16_expand_left (const BITCODE_RC *chain, size_t pos, size_t floor)
+{
+  size_t start = pos;
+  while (start >= floor + 2)
+    {
+      uint16_t c = (uint16_t)(chain[start - 2] | (chain[start - 1] << 8));
+      if (!r2007_utf16_codepoint_is_text (c))
+        break;
+      start -= 2;
+    }
+  return start;
+}
+
+static size_t
+r2007_utf16_expand_right (const BITCODE_RC *chain, size_t size, size_t pos)
+{
+  size_t end = pos;
+  while (end + 1 < size)
+    {
+      uint16_t c = (uint16_t)(chain[end] | (chain[end + 1] << 8));
+      if (!r2007_utf16_codepoint_is_text (c))
+        break;
+      end += 2;
+      if (end - pos >= 512)
+        break;
+    }
+  return end;
+}
+
+static size_t
+r2007_utf16be_expand_left (const BITCODE_RC *chain, size_t pos, size_t floor)
+{
+  size_t start = pos;
+  while (start >= floor + 2)
+    {
+      uint16_t c = (uint16_t)((chain[start - 2] << 8) | chain[start - 1]);
+      if (!r2007_utf16_codepoint_is_text (c))
+        break;
+      start -= 2;
+    }
+  return start;
+}
+
+static size_t
+r2007_utf16be_expand_right (const BITCODE_RC *chain, size_t size, size_t pos)
+{
+  size_t end = pos;
+  while (end + 1 < size)
+    {
+      uint16_t c = (uint16_t)((chain[end] << 8) | chain[end + 1]);
+      if (!r2007_utf16_codepoint_is_text (c))
+        break;
+      end += 2;
+      if (end - pos >= 512)
+        break;
+    }
+  return end;
+}
+
+static int
+r2007_accept_utf16_span (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                         size_t start, size_t end, BITCODE_RLL address_base,
+                         BITCODE_RLL layer_handle,
+                         BITCODE_RLL object_handle, BITCODE_BS object_type,
+                         r2007_raw_scan_stats *stats)
+{
+  size_t chars;
+  int has_cjk = 0;
+  int has_s_eq = 0;
+  char *text;
+
+  if (end <= start || ((end - start) & 1))
+    return 0;
+  chars = (end - start) / 2;
+  if (chars < 2 || chars > 256)
+    return 0;
+  if (!r2007_utf16_text_is_worthkeeping (&obj_dat->chain[start], chars,
+                                         &has_cjk, &has_s_eq))
+    return 0;
+  text = r2007_convert_utf16_raw_text (&obj_dat->chain[start], chars);
+  if (!text)
+    return DWG_ERR_OUTOFMEM;
+  if (has_cjk)
+    {
+      stats->cjk++;
+      dwg->r2007_raw_texts.raw_cjk_count++;
+    }
+  return r2007_raw_text_append (dwg, text, layer_handle, object_handle,
+                                address_base + (BITCODE_RLL)start,
+                                object_type, R2007_RAW_SRC_UTF16LE, stats);
+}
+
+static int
+r2007_utf16be_text_is_worthkeeping (const BITCODE_RC *src, size_t chars,
+                                    int *has_cjk, int *has_s_eq)
+{
+  int cjk = 0;
+  int s_eq = 0;
+
+  if (!src || chars < 2)
+    return 0;
+  for (size_t i = 0; i < chars; i++)
+    {
+      uint16_t c = (uint16_t)((src[i * 2] << 8) | src[i * 2 + 1]);
+      if (r2007_utf16_codepoint_is_cjk (c))
+        cjk = 1;
+      if (i + 1 < chars)
+        {
+          uint16_t n = (uint16_t)((src[i * 2 + 2] << 8) | src[i * 2 + 3]);
+          if (c == 'S' && n == '=')
+            s_eq = 1;
+        }
+    }
+  if (has_cjk)
+    *has_cjk = cjk;
+  if (has_s_eq)
+    *has_s_eq = s_eq;
+  return cjk || s_eq;
+}
+
+static int
+r2007_accept_utf16be_span (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                           size_t start, size_t end, BITCODE_RLL address_base,
+                           BITCODE_RLL layer_handle,
+                           BITCODE_RLL object_handle, BITCODE_BS object_type,
+                           r2007_raw_scan_stats *stats)
+{
+  size_t chars;
+  int has_cjk = 0;
+  int has_s_eq = 0;
+  char *text;
+
+  if (end <= start || ((end - start) & 1))
+    return 0;
+  chars = (end - start) / 2;
+  if (chars < 2 || chars > 256)
+    return 0;
+  if (!r2007_utf16be_text_is_worthkeeping (&obj_dat->chain[start], chars,
+                                           &has_cjk, &has_s_eq))
+    return 0;
+  text = r2007_convert_utf16be_raw_text (&obj_dat->chain[start], chars);
+  if (!text)
+    return DWG_ERR_OUTOFMEM;
+  if (has_cjk)
+    {
+      stats->cjk++;
+      dwg->r2007_raw_texts.raw_cjk_count++;
+    }
+  return r2007_raw_text_append (dwg, text, layer_handle, object_handle,
+                                address_base + (BITCODE_RLL)start,
+                                object_type, R2007_RAW_SRC_UTF16BE, stats);
+}
+
+static size_t
+r2007_ascii_expand_left (const BITCODE_RC *chain, size_t pos, size_t floor)
+{
+  size_t start = pos;
+  while (start > floor)
+    {
+      BITCODE_RC c = chain[start - 1];
+      if (c < 0x20 || c > 0x7e)
+        break;
+      start--;
+      if (pos - start >= 128)
+        break;
+    }
+  return start;
+}
+
+static size_t
+r2007_ascii_expand_right (const BITCODE_RC *chain, size_t size, size_t pos)
+{
+  size_t end = pos;
+  while (end < size)
+    {
+      BITCODE_RC c = chain[end];
+      if (c < 0x20 || c > 0x7e)
+        break;
+      end++;
+      if (end - pos >= 128)
+        break;
+    }
+  return end;
+}
+
+static int
+r2007_accept_ascii_span (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                         size_t start, size_t end, BITCODE_RLL address_base,
+                         BITCODE_RLL layer_handle,
+                         BITCODE_RLL object_handle, BITCODE_BS object_type,
+                         r2007_raw_scan_stats *stats)
+{
+  size_t len;
+  char *text;
+
+  if (end <= start)
+    return 0;
+  len = end - start;
+  if (len < 3 || len > 128)
+    return 0;
+  text = r2007_copy_ascii_raw_text (&obj_dat->chain[start], len);
+  if (!text)
+    return DWG_ERR_OUTOFMEM;
+  if (!r2007_ascii_text_is_worthkeeping (text, len))
+    {
+      free (text);
+      if (stats)
+        stats->filtered++;
+      dwg->r2007_raw_texts.raw_filtered_count++;
+      return 0;
+    }
+  return r2007_raw_text_append (dwg, text, layer_handle, object_handle,
+                                address_base + (BITCODE_RLL)start,
+                                object_type, R2007_RAW_SRC_ASCII, stats);
+}
+
+static int
+r2007_accept_ascii_span_at (Dwg_Data *restrict dwg,
+                            const BITCODE_RC *restrict chain, size_t start,
+                            size_t end, BITCODE_RLL address_base,
+                            BITCODE_RLL layer_handle,
+                            BITCODE_RLL object_handle, BITCODE_BS object_type,
+                            r2007_raw_scan_stats *stats)
+{
+  size_t len;
+  char *text;
+
+  if (!chain || end <= start)
+    return 0;
+  len = end - start;
+  if (len < 3 || len > 128)
+    return 0;
+  text = r2007_copy_ascii_raw_text (&chain[start], len);
+  if (!text)
+    return DWG_ERR_OUTOFMEM;
+  if (!r2007_ascii_text_is_worthkeeping (text, len))
+    {
+      free (text);
+      if (stats)
+        stats->filtered++;
+      dwg->r2007_raw_texts.raw_filtered_count++;
+      return 0;
+    }
+  return r2007_raw_text_append (dwg, text, layer_handle, object_handle,
+                                address_base + (BITCODE_RLL)start,
+                                object_type, R2007_RAW_SRC_ASCII, stats);
+}
+
+static int
+r2007_utf16_span_is_general_text (const BITCODE_RC *src, size_t chars,
+                                  int allow_single_cjk)
+{
+  int has_cjk = 0;
+  int has_digit = 0;
+  int has_alpha = 0;
+  int has_s_eq = 0;
+  int dots = 0;
+
+  if (!src || chars < 1 || chars > 64)
+    return 0;
+  for (size_t i = 0; i < chars; i++)
+    {
+      uint16_t c = (uint16_t)(src[i * 2] | (src[i * 2 + 1] << 8));
+      if (r2007_utf16_codepoint_is_cjk (c))
+        has_cjk = 1;
+      else if (c >= '0' && c <= '9')
+        has_digit = 1;
+      else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+        has_alpha = 1;
+      else if (c == '.')
+        dots++;
+      else if (c == 0x3001 || c == 0x3002 || c == 0xff0c || c == 0xff08
+               || c == 0xff09 || c == 0x3001)
+        ;
+      else if (c == '=')
+        ;
+      else
+        return 0;
+      if ((c & 0x00ff) == 0 && (c >> 8) >= 0x20 && (c >> 8) <= 0x7e)
+        return 0;
+      if (i + 1 < chars)
+        {
+          uint16_t n = (uint16_t)(src[i * 2 + 2] | (src[i * 2 + 3] << 8));
+          if (c == 'S' && n == '=')
+            has_s_eq = 1;
+        }
+    }
+  if (has_s_eq)
+    return 1;
+  if (has_cjk)
+    return chars > 1 || allow_single_cjk;
+  if (has_alpha && has_digit)
+    return 1;
+  if (has_digit && !has_alpha && dots <= 1)
+    return 1;
+  return 0;
+}
+
+static int
+r2007_utf16_units_are_useful (const uint16_t *units, size_t chars,
+                              size_t *visible_chars, int *has_cjk_out)
+{
+  int has_cjk = 0;
+  int has_digit = 0;
+  int has_alpha = 0;
+  int has_s_eq = 0;
+  int dots = 0;
+  size_t visible;
+
+  if (!units || chars < 1 || chars > 65)
+    return 0;
+
+  visible = chars;
+  if (visible && units[visible - 1] == 0)
+    visible--;
+  if (!visible || visible > 64)
+    return 0;
+
+  for (size_t i = 0; i < visible; i++)
+    {
+      uint16_t c = units[i];
+
+      if (r2007_utf16_codepoint_is_cjk (c))
+        has_cjk = 1;
+      else if (c >= '0' && c <= '9')
+        has_digit = 1;
+      else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
+        has_alpha = 1;
+      else if (c == '.')
+        dots++;
+      else if (c == '=' || c == '-' || c == '_' || c == '#')
+        ;
+      else if (c == 0x3001 || c == 0x3002 || c == 0xff0c || c == 0xff08
+               || c == 0xff09 || c == 0xff1d)
+        ;
+      else
+        return 0;
+
+      if (i + 1 < visible && c == 'S' && units[i + 1] == '=')
+        has_s_eq = 1;
+    }
+
+  if (visible_chars)
+    *visible_chars = visible;
+  if (has_cjk_out)
+    *has_cjk_out = has_cjk;
+  return has_cjk || has_s_eq || (has_alpha && has_digit)
+         || (has_digit && !has_alpha && dots <= 1);
+}
+
+static char *
+r2007_convert_utf16_units (const uint16_t *units, size_t visible)
+{
+  BITCODE_RC *tmp;
+  char *out;
+
+  if (!units || !visible)
+    return NULL;
+  tmp = (BITCODE_RC *)calloc (visible + 1, 2);
+  if (!tmp)
+    return NULL;
+  for (size_t i = 0; i < visible; i++)
+    {
+      tmp[i * 2] = (BITCODE_RC)(units[i] & 0xff);
+      tmp[i * 2 + 1] = (BITCODE_RC)(units[i] >> 8);
+    }
+  out = bit_convert_TU ((BITCODE_TU)tmp);
+  free (tmp);
+  return out;
+}
+
+static int
+r2007_accept_utf16_units (Dwg_Data *restrict dwg, const uint16_t *units,
+                          size_t chars, BITCODE_RLL address,
+                          BITCODE_RLL layer_handle,
+                          BITCODE_RLL object_handle, BITCODE_BS object_type,
+                          BITCODE_RC source, r2007_raw_scan_stats *stats)
+{
+  size_t visible = 0;
+  int has_cjk = 0;
+  char *text;
+
+  if (!r2007_utf16_units_are_useful (units, chars, &visible, &has_cjk))
+    return 0;
+  text = r2007_convert_utf16_units (units, visible);
+  if (!text)
+    return DWG_ERR_OUTOFMEM;
+  if (has_cjk)
+    {
+      if (stats)
+        stats->cjk++;
+      dwg->r2007_raw_texts.raw_cjk_count++;
+    }
+  return r2007_raw_text_append (dwg, text, layer_handle, object_handle,
+                                address, object_type, source, stats);
+}
+
+static int
+r2007_scan_bitcoded_tu_strings (Dwg_Data *restrict dwg,
+                                Bit_Chain *restrict sec_dat,
+                                BITCODE_RLL address_base,
+                                BITCODE_RLL layer_handle,
+                                BITCODE_RLL object_handle,
+                                BITCODE_BS object_type,
+                                r2007_raw_scan_stats *stats)
+{
+  int error = 0;
+
+  if (!dwg || !sec_dat || !sec_dat->chain || sec_dat->size < 4)
+    return 0;
+
+  for (size_t byte = 0; byte + 4 < sec_dat->size; byte++)
+    for (unsigned bit = 0; bit < 8; bit++)
+      {
+        Bit_Chain cur = *sec_dat;
+        uint16_t units[66];
+        BITCODE_BS chars;
+        size_t start_byte;
+        unsigned start_bit;
+
+        cur.byte = byte;
+        cur.bit = bit;
+        chars = bit_read_BS (&cur);
+        if (chars < 1 || chars > 65)
+          continue;
+        if (bit_position (&cur) + ((size_t)chars * 16) > sec_dat->size * 8)
+          continue;
+
+        start_byte = cur.byte;
+        start_bit = cur.bit;
+        for (BITCODE_BS i = 0; i < chars; i++)
+          units[i] = bit_read_RS (&cur);
+        error |= r2007_accept_utf16_units (
+            dwg, units, chars,
+            address_base + (BITCODE_RLL)(start_byte * 8 + start_bit),
+            layer_handle, object_handle, object_type, R2007_RAW_SRC_TU_PREFIX,
+            stats);
+      }
+
+  return error;
+}
+
+static int
+r2007_scan_fixed_utf16_length_strings (Dwg_Data *restrict dwg,
+                                       Bit_Chain *restrict sec_dat,
+                                       BITCODE_RLL address_base,
+                                       BITCODE_RLL layer_handle,
+                                       BITCODE_RLL object_handle,
+                                       BITCODE_BS object_type,
+                                       r2007_raw_scan_stats *stats)
+{
+  int error = 0;
+
+  if (!dwg || !sec_dat || !sec_dat->chain || sec_dat->size < 4)
+    return 0;
+
+  for (size_t pos = 0; pos + 4 < sec_dat->size; pos++)
+    {
+      uint16_t chars = (uint16_t)(sec_dat->chain[pos]
+                                  | (sec_dat->chain[pos + 1] << 8));
+      uint16_t units[66];
+
+      if (chars < 1 || chars > 65)
+        continue;
+      if (pos + 2 + ((size_t)chars * 2) > sec_dat->size)
+        continue;
+      for (uint16_t i = 0; i < chars; i++)
+        units[i] = (uint16_t)(sec_dat->chain[pos + 2 + (i * 2)]
+                              | (sec_dat->chain[pos + 3 + (i * 2)] << 8));
+      error |= r2007_accept_utf16_units (
+          dwg, units, chars, address_base + (BITCODE_RLL)pos, layer_handle,
+          object_handle, object_type, R2007_RAW_SRC_TU_PREFIX, stats);
+    }
+
+  return error;
+}
+
+static int
+codepage_span_is_text (const BITCODE_RC *buf, size_t len)
+{
+  int has_high = 0;
+
+  if (!buf || len < 2 || len > 64)
+    return 0;
+  for (size_t i = 0; i < len; i++)
+    {
+      if (!r2007_raw_codepage_byte_is_text (buf[i]))
+        return 0;
+      if (buf[i] >= 0x80)
+        has_high = 1;
+    }
+  return has_high;
+}
+
+static int
+r2007_scan_length_prefixed_codepage_strings (
+    Dwg_Data *restrict dwg, Bit_Chain *restrict sec_dat,
+    BITCODE_RLL address_base, BITCODE_RLL layer_handle,
+    BITCODE_RLL object_handle, BITCODE_BS object_type,
+    r2007_raw_scan_stats *stats)
+{
+  int error = 0;
+
+  if (!dwg || !sec_dat || !sec_dat->chain || sec_dat->size < 3
+      || !dwg->header.codepage || dwg->header.codepage == CP_UTF16)
+    return 0;
+
+  for (size_t pos = 0; pos + 2 < sec_dat->size; pos++)
+    {
+      size_t len = sec_dat->chain[pos];
+      char *raw;
+      char *utf8;
+
+      if (pos + 1 + len > sec_dat->size
+          || !codepage_span_is_text (&sec_dat->chain[pos + 1], len))
+        continue;
+
+      raw = (char *)malloc (len + 1);
+      if (!raw)
+        return DWG_ERR_OUTOFMEM;
+      memcpy (raw, &sec_dat->chain[pos + 1], len);
+      raw[len] = '\0';
+      utf8 = bit_TV_to_utf8 (raw, dwg->header.codepage);
+      if (utf8 && r2007_utf8_text_is_useful (utf8))
+        {
+          error |= r2007_raw_text_append (
+              dwg, utf8, layer_handle, object_handle,
+              address_base + (BITCODE_RLL)pos, object_type,
+              R2007_RAW_SRC_TV_PREFIX, stats);
+          if (utf8 != raw)
+            free (raw);
+        }
+      else
+        {
+          if (utf8 && utf8 != raw)
+            free (utf8);
+          free (raw);
+          if (stats)
+            stats->filtered++;
+          dwg->r2007_raw_texts.raw_filtered_count++;
+        }
+    }
+
+  return error;
+}
+
+static int
+scan_r2007_general_raw_strings (Dwg_Data *restrict dwg,
+                                Bit_Chain *restrict sec_dat,
+                                BITCODE_RLL address_base,
+                                const char *label,
+                                BITCODE_RLL layer_handle,
+                                BITCODE_RLL object_handle,
+                                BITCODE_BS object_type)
+{
+  r2007_raw_scan_stats stats = { 0 };
+  int error = 0;
+  int bounded_object = layer_handle || object_handle || object_type;
+
+  if (!dwg || !sec_dat || !sec_dat->chain || sec_dat->size < 4)
+    return 0;
+
+  for (size_t base = 0; base < 2; base++)
+    for (size_t i = base; i + 1 < sec_dat->size;)
+      {
+        size_t start = i;
+        size_t chars = 0;
+        while (i + 1 < sec_dat->size)
+          {
+            uint16_t c = (uint16_t)(sec_dat->chain[i]
+                                    | (sec_dat->chain[i + 1] << 8));
+            if (!r2007_utf16_codepoint_is_text (c))
+              break;
+            chars++;
+            i += 2;
+            if (chars >= 64)
+              break;
+          }
+        if (chars >= (bounded_object ? 1 : 2)
+            && r2007_utf16_span_is_general_text (&sec_dat->chain[start],
+                                                 chars, bounded_object))
+          {
+            char *text = r2007_convert_utf16_raw_text (&sec_dat->chain[start],
+                                                       chars);
+            if (text)
+              error |= r2007_raw_text_append (dwg, text, layer_handle,
+                                              object_handle,
+                                              address_base + (BITCODE_RLL)start,
+                                              object_type,
+                                              R2007_RAW_SRC_UTF16LE,
+                                              &stats);
+          }
+        else if (chars)
+          {
+            stats.filtered++;
+            dwg->r2007_raw_texts.raw_filtered_count++;
+          }
+        if (i == start)
+          i += 2;
+      }
+
+  if (bounded_object)
+    {
+      for (size_t i = 0; i < sec_dat->size;)
+        {
+          size_t start = i;
+          while (i < sec_dat->size && sec_dat->chain[i] >= 0x20
+                 && sec_dat->chain[i] <= 0x7e)
+            {
+              i++;
+              if (i - start >= 128)
+                break;
+            }
+          if (i > start)
+            error |= r2007_accept_ascii_span_at (
+                dwg, sec_dat->chain, start, i, address_base, layer_handle,
+                object_handle, object_type, &stats);
+          else
+            i++;
+        }
+    }
+  else
+    {
+      for (size_t pos = 0; pos + 1 < sec_dat->size;)
+        {
+          static const BITCODE_RC s_eq_ascii[] = { 'S', '=' };
+          pos = r2007_find_bytes (sec_dat->chain, sec_dat->size, s_eq_ascii,
+                                  sizeof (s_eq_ascii), pos);
+          if (pos == SIZE_MAX)
+            break;
+          if (pos + 2 < sec_dat->size && sec_dat->chain[pos + 2] >= '0'
+              && sec_dat->chain[pos + 2] <= '9')
+            {
+              size_t start = r2007_ascii_expand_left (sec_dat->chain, pos, 0);
+              size_t end = r2007_ascii_expand_right (sec_dat->chain,
+                                                     sec_dat->size, pos);
+              error |= r2007_accept_ascii_span_at (
+                  dwg, sec_dat->chain, start, end, address_base, layer_handle,
+                  object_handle, object_type, &stats);
+            }
+          pos += sizeof (s_eq_ascii);
+        }
+    }
+
+  error |= r2007_scan_codepage_raw_strings (dwg, sec_dat, address_base,
+                                            layer_handle, object_handle,
+                                            object_type, &stats);
+
+  if (bounded_object)
+    {
+      if (getenv ("LIBDWG_R2007_BITCODED_TU_SCAN"))
+        error |= r2007_scan_bitcoded_tu_strings (dwg, sec_dat, address_base,
+                                                 layer_handle, object_handle,
+                                                 object_type, &stats);
+      error |= r2007_scan_fixed_utf16_length_strings (
+          dwg, sec_dat, address_base, layer_handle, object_handle,
+          object_type, &stats);
+      error |= r2007_scan_length_prefixed_codepage_strings (
+          dwg, sec_dat, address_base, layer_handle, object_handle,
+          object_type, &stats);
+    }
+
+  if (label)
+    fprintf (stderr,
+             "R2007 raw text section %s: accepted=%u, S_eq=%u, "
+             "unassigned=%u, filtered=%u\n",
+             label, stats.accepted, stats.s_eq, stats.unassigned,
+             stats.filtered);
+  return error;
+}
+
+static int
+scan_r2007_raw_object_span (Dwg_Data *restrict dwg,
+                            Bit_Chain *restrict obj_dat, size_t address,
+                            const char *label)
+{
+  Bit_Chain span = { 0 };
+  size_t body_address = 0;
+  BITCODE_MS size;
+
+  if (!obj_dat || !obj_dat->chain || address + 4 >= obj_dat->size)
+    return 0;
+  size = r2007_read_ms_at (obj_dat->chain, obj_dat->size, address,
+                           &body_address);
+  if (size < 10 || body_address + size > obj_dat->size)
+    return 0;
+  span = *obj_dat;
+  span.chain = &obj_dat->chain[body_address];
+  span.byte = 0;
+  span.bit = 0;
+  span.size = size;
+  return scan_r2007_general_raw_strings (dwg, &span,
+                                         (BITCODE_RLL)body_address, label,
+                                         0, 0, 0);
+}
+
+static int
+scan_r2007_raw_strings (Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+                        Bit_Chain *restrict hdl)
+{
+  r2007_raw_scan_stats stats = { 0 };
+  r2007_probe_vec probes = { 0 };
+  r2007_handle_vec decoded_raw_probes = { 0 };
+  unsigned context_hits = 0;
+  unsigned decoded_hits = 0;
+  int error = 0;
+
+  if (!dwg || !obj_dat || !obj_dat->chain || obj_dat->size < 4)
+    return 0;
+
+  error |= r2007_build_probe_index (dwg, obj_dat, &probes);
+
+  for (size_t pos = 0; pos + 3 < obj_dat->size;)
+    {
+      static const BITCODE_RC s_eq_utf16[] = { 'S', 0, '=', 0 };
+      pos = r2007_find_bytes (obj_dat->chain, obj_dat->size, s_eq_utf16,
+                              sizeof (s_eq_utf16), pos);
+      if (pos == SIZE_MAX)
+        break;
+      {
+        size_t start = r2007_utf16_expand_left (obj_dat->chain, pos,
+                                                pos & 1);
+        size_t end = r2007_utf16_expand_right (obj_dat->chain, obj_dat->size,
+                                               pos);
+        BITCODE_RLL layer_handle = 0;
+        BITCODE_RLL object_handle = 0;
+        BITCODE_BS object_type = 0;
+        r2007_raw_context_for_pos (dwg, obj_dat, hdl, &probes, pos,
+                                   &decoded_raw_probes, &layer_handle,
+                                   &object_handle, &object_type,
+                                   &context_hits, &decoded_hits, &error);
+        error |= r2007_accept_utf16_span (
+            dwg, obj_dat, start, end, 0, layer_handle, object_handle,
+            object_type, &stats);
+      }
+      pos += sizeof (s_eq_utf16);
+    }
+
+  for (size_t pos = 0; pos + 3 < obj_dat->size;)
+    {
+      static const BITCODE_RC s_eq_utf16be[] = { 0, 'S', 0, '=' };
+      pos = r2007_find_bytes (obj_dat->chain, obj_dat->size, s_eq_utf16be,
+                              sizeof (s_eq_utf16be), pos);
+      if (pos == SIZE_MAX)
+        break;
+      {
+        size_t start = r2007_utf16be_expand_left (obj_dat->chain, pos,
+                                                  pos & 1);
+        size_t end = r2007_utf16be_expand_right (obj_dat->chain,
+                                                 obj_dat->size, pos);
+        BITCODE_RLL layer_handle = 0;
+        BITCODE_RLL object_handle = 0;
+        BITCODE_BS object_type = 0;
+        r2007_raw_context_for_pos (dwg, obj_dat, hdl, &probes, pos,
+                                   &decoded_raw_probes, &layer_handle,
+                                   &object_handle, &object_type,
+                                   &context_hits, &decoded_hits, &error);
+        error |= r2007_accept_utf16be_span (
+            dwg, obj_dat, start, end, 0, layer_handle, object_handle,
+            object_type, &stats);
+      }
+      pos += sizeof (s_eq_utf16be);
+    }
+
+  for (size_t pos = 0; pos + 1 < obj_dat->size;)
+    {
+      static const BITCODE_RC s_eq_ascii[] = { 'S', '=' };
+      pos = r2007_find_bytes (obj_dat->chain, obj_dat->size, s_eq_ascii,
+                              sizeof (s_eq_ascii), pos);
+      if (pos == SIZE_MAX)
+        break;
+      if (pos + 2 < obj_dat->size && obj_dat->chain[pos + 2] >= '0'
+          && obj_dat->chain[pos + 2] <= '9')
+        {
+          size_t start = r2007_ascii_expand_left (obj_dat->chain, pos, 0);
+          size_t end = r2007_ascii_expand_right (obj_dat->chain,
+                                                 obj_dat->size, pos);
+          BITCODE_RLL layer_handle = 0;
+          BITCODE_RLL object_handle = 0;
+          BITCODE_BS object_type = 0;
+          r2007_raw_context_for_pos (dwg, obj_dat, hdl, &probes, pos,
+                                     &decoded_raw_probes, &layer_handle,
+                                     &object_handle, &object_type,
+                                     &context_hits, &decoded_hits, &error);
+          error |= r2007_accept_ascii_span (
+              dwg, obj_dat, start, end, 0, layer_handle, object_handle,
+              object_type, &stats);
+        }
+      pos += sizeof (s_eq_ascii);
+    }
+
+  fprintf (stderr,
+           "R2007 raw text recovery: accepted=%u, S_eq=%u, cjk=%u, "
+           "unassigned=%u, filtered=%u, context_hits=%u, "
+           "context_decoded=%u, probe_index=%u\n",
+           stats.accepted, stats.s_eq, stats.cjk, stats.unassigned,
+           stats.filtered, context_hits, decoded_hits,
+           (unsigned)probes.num);
+  r2007_probe_vec_free (&probes);
+  r2007_handle_vec_free (&decoded_raw_probes);
+  return error;
+}
+
+static BITCODE_RLL
+r2007_max_reasonable_handle (Dwg_Data *restrict dwg)
+{
+  BITCODE_RLL handseed = dwg->header_vars.HANDSEED
+                             ? dwg->header_vars.HANDSEED->absolute_ref
+                             : 0;
+  BITCODE_RLL max_handle = 0;
+
+  for (BITCODE_BL i = 0; i < dwg->num_objects; i++)
+    {
+      BITCODE_RLL h = dwg->object[i].handle.value;
+      if (!h)
+        continue;
+      if (handseed && h > handseed)
+        continue;
+      if (h > max_handle)
+        max_handle = h;
+    }
+  return max_handle;
+}
+
+static size_t
+r2007_handle_pattern (BITCODE_RLL handle, unsigned code, BITCODE_RC pat[9])
+{
+  unsigned size = 0;
+  BITCODE_RLL tmp = handle;
+
+  while (tmp)
+    {
+      size++;
+      tmp >>= 8;
+    }
+  if (!size || size > 8 || code > 0xf)
+    return 0;
+  pat[0] = (BITCODE_RC)((code << 4) | size);
+  for (unsigned i = 0; i < size; i++)
+    pat[1 + i] = (BITCODE_RC)((handle >> (8 * (size - i - 1))) & 0xff);
+  return size + 1;
+}
+
+static size_t
+r2007_find_bytes (const BITCODE_RC *haystack, size_t haystack_size,
+                  const BITCODE_RC *needle, size_t needle_size,
+                  size_t start)
+{
+  if (!needle_size || haystack_size < needle_size || start > haystack_size)
+    return SIZE_MAX;
+  for (size_t i = start; i + needle_size <= haystack_size; i++)
+    {
+      if (haystack[i] == needle[0]
+          && memcmp (&haystack[i], needle, needle_size) == 0)
+        return i;
+    }
+  return SIZE_MAX;
+}
+
+static int
+r2007_decode_recovery_probe (Dwg_Data *restrict dwg,
+                             Bit_Chain *restrict obj_dat,
+                             Bit_Chain *restrict hdl,
+                             const r2007_probe *restrict probe,
+                             int *restrict error)
+{
+  BITCODE_BL before = dwg->num_objects;
+  int added;
+
+  if (r2007_object_has_handle (dwg, probe->handle))
+    return 0;
+
+  added = dwg_decode_add_object (dwg, obj_dat, hdl, probe->address);
+  if (added > 0)
+    *error |= added;
+  return dwg->num_objects > before ? 1 : 0;
+}
+
+static int
+r2007_recover_near_handle_pattern (Dwg_Data *restrict dwg,
+                                   Bit_Chain *restrict obj_dat,
+                                   Bit_Chain *restrict hdl,
+                                   BITCODE_RLL handle,
+                                   unsigned ref_code,
+                                   int want_layer_object,
+                                   unsigned *recovered_layers,
+                                   unsigned *recovered_textlike,
+                                   unsigned *pattern_hits,
+                                   unsigned *probe_hits)
+{
+  BITCODE_RC pattern[9];
+  size_t pattern_len = r2007_handle_pattern (handle, ref_code, pattern);
+  size_t pos = 0;
+  int error = 0;
+
+  if (!pattern_len)
+    return 0;
+
+  for (unsigned variant = 0; variant < 2; variant++)
+    {
+      const BITCODE_RC *needle = variant ? &pattern[1] : pattern;
+      size_t needle_len = variant ? pattern_len - 1 : pattern_len;
+      pos = 0;
+      if (!needle_len)
+        continue;
+
+      while ((pos = r2007_find_bytes (obj_dat->chain, obj_dat->size, needle,
+                                      needle_len, pos))
+             != SIZE_MAX)
+        {
+          const size_t back_limit = want_layer_object ? 128 : 4096;
+          size_t start = pos > back_limit ? pos - back_limit : 0;
+          int recovered_here = 0;
+          (*pattern_hits)++;
+
+          for (size_t address = start;
+               address <= pos && address + 12 < obj_dat->size; address++)
+            {
+              r2007_probe probe;
+              int decoded;
+
+              if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+                continue;
+              (*probe_hits)++;
+              if (pos < probe.body_address
+                  || pos >= probe.body_address + probe.size)
+                continue;
+              if (want_layer_object)
+                {
+                  if (probe.type != DWG_TYPE_LAYER || probe.handle != handle)
+                    continue;
+                }
+              else
+                {
+                  if (!r2007_fixed_type_may_have_text (probe.type)
+                      && !r2007_class_name_may_have_text (dwg, probe.type)
+                      && probe.type != DWG_TYPE_PROXY_ENTITY
+                      && probe.type != DWG_TYPE_PROXY_OBJECT
+                      && probe.type != DWG_TYPE_UNKNOWN_ENT
+                      && probe.type != DWG_TYPE_UNKNOWN_OBJ)
+                    continue;
+                }
+
+              decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl,
+                                                     &probe, &error);
+              if (decoded > 0)
+                {
+                  Dwg_Object *obj = &dwg->object[dwg->num_objects - 1];
+                  if (obj->fixedtype == DWG_TYPE_LAYER)
+                    (*recovered_layers)++;
+                  else
+                    (*recovered_textlike)++;
+                }
+              recovered_here = 1;
+              break;
+            }
+
+          pos += needle_len;
+          if (want_layer_object && recovered_here)
+            break;
+        }
+    }
+
+  return error;
+}
+
+static int
+r2007_recover_near_text_pattern (Dwg_Data *restrict dwg,
+                                 Bit_Chain *restrict obj_dat,
+                                 Bit_Chain *restrict hdl,
+                                 const BITCODE_RC *pattern,
+                                 size_t pattern_len,
+                                 r2007_handle_vec *restrict decoded_addresses,
+                                 unsigned *text_hits,
+                                 unsigned *text_probe_hits,
+                                 unsigned *recovered_textlike)
+{
+  size_t pos = 0;
+  int error = 0;
+
+  if (!pattern || !pattern_len)
+    return 0;
+
+  while ((pos = r2007_find_bytes (obj_dat->chain, obj_dat->size, pattern,
+                                  pattern_len, pos))
+         != SIZE_MAX)
+    {
+      const size_t back_limit = 2048;
+      size_t start = pos > back_limit ? pos - back_limit : 0;
+
+      (*text_hits)++;
+      for (size_t address = pos;; address--)
+        {
+          r2007_probe probe;
+          int decoded;
+
+          if (address + 12 >= obj_dat->size)
+            {
+              if (address == start)
+                break;
+              continue;
+            }
+          if (r2007_handle_vec_contains (decoded_addresses,
+                                         (BITCODE_RLL)address))
+            {
+              if (address == start)
+                break;
+              continue;
+            }
+          if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+            {
+              if (address == start)
+                break;
+              continue;
+            }
+          if (pos < probe.body_address
+              || pos >= probe.body_address + probe.size)
+            {
+              if (address == start)
+                break;
+              continue;
+            }
+          if (!r2007_fixed_type_may_have_text (probe.type)
+              && !r2007_class_name_may_have_text (dwg, probe.type)
+              && probe.type != DWG_TYPE_PROXY_ENTITY
+              && probe.type != DWG_TYPE_PROXY_OBJECT)
+            {
+              if (address == start)
+                break;
+              continue;
+            }
+
+          (*text_probe_hits)++;
+          decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl, &probe,
+                                                 &error);
+          r2007_handle_vec_add (decoded_addresses, (BITCODE_RLL)address);
+          if (decoded > 0)
+            (*recovered_textlike)++;
+          break;
+        }
+
+      pos += pattern_len;
+    }
+
+  return error;
+}
+
+static int
+r2007_probe_span_has_layer_ref (Bit_Chain *restrict obj_dat,
+                                const r2007_probe *probe,
+                                const r2007_handle_vec *layers)
+{
+  if (!obj_dat || !obj_dat->chain || !probe || !layers || !layers->num)
+    return 0;
+
+  for (size_t i = 0; i < layers->num; i++)
+    {
+      BITCODE_RC pattern[9];
+      size_t pattern_len = r2007_handle_pattern (layers->items[i], 5, pattern);
+      if (!pattern_len)
+        continue;
+      for (unsigned variant = 0; variant < 2; variant++)
+        {
+          const BITCODE_RC *needle = variant ? &pattern[1] : pattern;
+          size_t needle_len = variant ? pattern_len - 1 : pattern_len;
+          if (!needle_len || needle_len > probe->size)
+            continue;
+          if (r2007_find_bytes (&obj_dat->chain[probe->body_address],
+                                probe->size, needle, needle_len, 0)
+              != SIZE_MAX)
+            return 1;
+        }
+    }
+  return 0;
+}
+
+static int
+r2007_recover_textlike_by_layer_refs (Dwg_Data *restrict dwg,
+                                      Bit_Chain *restrict obj_dat,
+                                      Bit_Chain *restrict hdl,
+                                      const r2007_handle_vec *layers,
+                                      unsigned *decoded,
+                                      unsigned *probe_hits)
+{
+  r2007_probe_vec probes = { 0 };
+  int error = 0;
+
+  if (!layers || !layers->num || !obj_dat || !obj_dat->chain)
+    return 0;
+
+  error |= r2007_build_probe_index (dwg, obj_dat, &probes);
+  for (size_t i = 0; i < probes.num; i++)
+    {
+      r2007_probe *probe = &probes.items[i];
+      int added;
+
+      if (!r2007_fixed_type_may_have_text (probe->type)
+          && !r2007_class_name_may_have_text (dwg, probe->type)
+          && probe->type != DWG_TYPE_PROXY_ENTITY
+          && probe->type != DWG_TYPE_PROXY_OBJECT
+          && probe->type != DWG_TYPE_UNKNOWN_ENT
+          && probe->type != DWG_TYPE_UNKNOWN_OBJ)
+        continue;
+      if (r2007_object_has_handle (dwg, probe->handle))
+        continue;
+      if (!r2007_probe_span_has_layer_ref (obj_dat, probe, layers))
+        continue;
+
+      if (probe_hits)
+        (*probe_hits)++;
+      added = r2007_decode_recovery_probe (dwg, obj_dat, hdl, probe, &error);
+      if (added > 0 && decoded)
+        (*decoded)++;
+    }
+
+  r2007_probe_vec_free (&probes);
+  return error;
+}
+
+static int
+r2007_recover_layer_name_fallback_by_layer_refs (
+    Dwg_Data *restrict dwg, Bit_Chain *restrict obj_dat,
+    Bit_Chain *restrict hdl, const r2007_handle_vec *layers,
+    unsigned *decoded, unsigned *probe_hits)
+{
+  r2007_handle_vec decoded_addresses = { 0 };
+  int error = 0;
+
+  if (!layers || !layers->num || !obj_dat || !obj_dat->chain)
+    return 0;
+
+  for (size_t i = 0; i < layers->num; i++)
+    {
+      BITCODE_RC pattern[9];
+      size_t pattern_len = r2007_handle_pattern (layers->items[i], 5,
+                                                 pattern);
+      if (!pattern_len)
+        continue;
+      for (unsigned variant = 0; variant < 2; variant++)
+        {
+          const BITCODE_RC *needle = variant ? &pattern[1] : pattern;
+          size_t needle_len = variant ? pattern_len - 1 : pattern_len;
+          size_t pos = 0;
+
+          if (!needle_len)
+            continue;
+          while ((pos = r2007_find_bytes (obj_dat->chain, obj_dat->size,
+                                          needle, needle_len, pos))
+                 != SIZE_MAX)
+            {
+              const size_t back_limit = 4096;
+              size_t start = pos > back_limit ? pos - back_limit : 0;
+
+              for (size_t address = start;
+                   address <= pos && address + 12 < obj_dat->size; address++)
+                {
+                  r2007_probe probe;
+                  int added;
+
+                  if (r2007_handle_vec_contains (&decoded_addresses,
+                                                 (BITCODE_RLL)address))
+                    continue;
+                  if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+                    continue;
+                  if (pos < probe.body_address
+                      || pos >= probe.body_address + probe.size)
+                    continue;
+                  if (!r2007_fixed_type_may_have_layer_name_text (probe.type))
+                    continue;
+                  if (r2007_object_has_handle (dwg, probe.handle))
+                    continue;
+
+                  if (probe_hits)
+                    (*probe_hits)++;
+                  added = r2007_decode_recovery_probe (dwg, obj_dat, hdl,
+                                                       &probe, &error);
+                  error |= r2007_handle_vec_add (
+                      &decoded_addresses, (BITCODE_RLL)address);
+                  if (added > 0 && decoded)
+                    (*decoded)++;
+                  break;
+                }
+              pos += needle_len;
+            }
+        }
+    }
+
+  r2007_handle_vec_free (&decoded_addresses);
+  return error;
+}
+
+static int
+r2007_recover_layer_name_fallback_linear (Dwg_Data *restrict dwg,
+                                          Bit_Chain *restrict obj_dat,
+                                          Bit_Chain *restrict hdl,
+                                          unsigned *decoded,
+                                          unsigned *probe_hits,
+                                          unsigned *skipped_existing,
+                                          unsigned *skipped_large)
+{
+  int error = 0;
+
+  if (!dwg || !obj_dat || !obj_dat->chain)
+    return 0;
+
+  for (size_t address = 0; address + 12 < obj_dat->size; address++)
+    {
+      r2007_probe probe;
+      int added;
+
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      if (!r2007_fixed_type_may_have_layer_name_text (probe.type))
+        continue;
+
+      if (probe_hits)
+        (*probe_hits)++;
+      if (r2007_object_has_handle (dwg, probe.handle))
+        {
+          if (skipped_existing)
+            (*skipped_existing)++;
+          continue;
+        }
+      if (probe.size > 65536)
+        {
+          if (skipped_large)
+            (*skipped_large)++;
+          continue;
+        }
+
+      added = r2007_decode_recovery_probe (dwg, obj_dat, hdl, &probe,
+                                           &error);
+      if (added > 0 && decoded)
+        (*decoded)++;
+    }
+
+  return error;
+}
+
+static int
+r2007_recover_unresolved_layers_linear (Dwg_Data *restrict dwg,
+                                        Bit_Chain *restrict obj_dat,
+                                        Bit_Chain *restrict hdl,
+                                        const r2007_handle_vec *targets,
+                                        unsigned *recovered_layers)
+{
+  int error = 0;
+
+  if (!targets || !targets->num)
+    return 0;
+
+  for (size_t address = 0; address + 12 < obj_dat->size; address++)
+    {
+      r2007_probe probe;
+      int decoded;
+
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      if (probe.type != DWG_TYPE_LAYER)
+        continue;
+      if (!r2007_handle_vec_contains (targets, probe.handle)
+          || r2007_object_has_handle (dwg, probe.handle))
+        continue;
+
+      decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl, &probe,
+                                             &error);
+      if (decoded > 0)
+        (*recovered_layers)++;
+      if (*recovered_layers >= targets->num)
+        break;
+    }
+
+  return error;
+}
+
+static int
+r2007_scan_failed_object_spans (Dwg_Data *restrict dwg,
+                                Bit_Chain *restrict obj_dat,
+                                Bit_Chain *restrict hdl,
+                                const r2007_handle_vec *failed_addresses,
+                                unsigned *decoded_failed,
+                                unsigned *raw_scanned_failed,
+                                unsigned *recovered_textlike)
+{
+  int error = 0;
+
+  if (!failed_addresses || !failed_addresses->num || !obj_dat
+      || !obj_dat->chain)
+    return 0;
+
+  for (size_t i = 0; i < failed_addresses->num; i++)
+    {
+      size_t address = (size_t)failed_addresses->items[i];
+      r2007_probe probe;
+      Bit_Chain span = { 0 };
+      BITCODE_RLL layer_handle = 0;
+      int decoded;
+
+      if (!r2007_probe_object (dwg, obj_dat, address, &probe))
+        continue;
+      if (probe.type == DWG_TYPE_LAYER)
+        continue;
+      if (!r2007_fixed_type_may_have_text (probe.type)
+          && !r2007_class_name_may_have_text (dwg, probe.type)
+          && probe.type != DWG_TYPE_PROXY_ENTITY
+          && probe.type != DWG_TYPE_PROXY_OBJECT
+          && probe.type != DWG_TYPE_UNKNOWN_ENT
+          && probe.type != DWG_TYPE_UNKNOWN_OBJ)
+        continue;
+
+      decoded = r2007_decode_recovery_probe (dwg, obj_dat, hdl, &probe,
+                                             &error);
+      if (decoded > 0)
+        {
+          Dwg_Object *obj = &dwg->object[dwg->num_objects - 1];
+          if (obj->supertype == DWG_SUPERTYPE_ENTITY)
+            {
+              layer_handle = r2007_layer_handle_for_probe (dwg, &probe);
+              if (layer_handle)
+                {
+                  span = *obj_dat;
+                  span.chain = &obj_dat->chain[probe.body_address];
+                  span.byte = 0;
+                  span.bit = 0;
+                  span.size = probe.size;
+                  error |= scan_r2007_general_raw_strings (
+                      dwg, &span, (BITCODE_RLL)probe.body_address, NULL,
+                      layer_handle, probe.handle, probe.type);
+                  (*raw_scanned_failed)++;
+                }
+            }
+          (*decoded_failed)++;
+          (*recovered_textlike)++;
+          continue;
+        }
+
+      span = *obj_dat;
+      span.chain = &obj_dat->chain[probe.body_address];
+      span.byte = 0;
+      span.bit = 0;
+      span.size = probe.size;
+      error |= scan_r2007_general_raw_strings (
+          dwg, &span, (BITCODE_RLL)probe.body_address, NULL, 0,
+          probe.handle, probe.type);
+      (*raw_scanned_failed)++;
+    }
+
+  return error;
+}
+
+static int
+r2007_scan_suspicious_decoded_text_spans (Dwg_Data *restrict dwg,
+                                          Bit_Chain *restrict obj_dat,
+                                          unsigned *scanned)
+{
+  int error = 0;
+  unsigned candidates = 0;
+  unsigned invalid_span = 0;
+  unsigned indexed_probes = 0;
+  unsigned fallback_scanned = 0;
+  r2007_probe_vec probes = { 0 };
+  r2007_handle_vec scanned_handles = { 0 };
+
+  if (!dwg || !obj_dat || !obj_dat->chain)
+    return 0;
+
+  error |= r2007_build_probe_index (dwg, obj_dat, &probes);
+  indexed_probes = (unsigned)probes.num;
+  for (size_t i = 0; i < probes.num; i++)
+    {
+      const r2007_probe *probe = &probes.items[i];
+      Dwg_Object *obj = r2007_find_decoded_object_for_probe (dwg, probe);
+      Bit_Chain span = { 0 };
+      BITCODE_RLL layer_handle;
+
+      if (!obj || (probe->handle
+                   && r2007_handle_vec_contains (&scanned_handles,
+                                                 probe->handle)))
+        continue;
+      if (!r2007_decoded_text_object_needs_raw_scan (dwg, obj))
+        continue;
+
+      candidates++;
+      layer_handle = r2007_layer_handle_for_decoded_object (obj);
+      if (!layer_handle)
+        layer_handle = r2007_layer_handle_for_probe (dwg, probe);
+
+      span = *obj_dat;
+      span.chain = &obj_dat->chain[probe->body_address];
+      span.byte = 0;
+      span.bit = 0;
+      span.size = probe->size;
+
+      error |= scan_r2007_general_raw_strings (
+          dwg, &span, (BITCODE_RLL)probe->body_address, NULL, layer_handle,
+          probe->handle, probe->type);
+      if (scanned)
+        (*scanned)++;
+      error |= r2007_handle_vec_add (&scanned_handles, probe->handle);
+    }
+
+  for (BITCODE_BL i = 0; i < dwg->num_objects; i++)
+    {
+      Dwg_Object *obj = &dwg->object[i];
+      Bit_Chain span = { 0 };
+      BITCODE_RLL layer_handle;
+
+      if (!r2007_decoded_text_object_needs_raw_scan (dwg, obj))
+        continue;
+      if (obj->handle.value
+          && r2007_handle_vec_contains (&scanned_handles,
+                                        obj->handle.value))
+        continue;
+      candidates++;
+      if (!obj->address || !obj->size
+          || obj->address + obj->size > obj_dat->size)
+        {
+          invalid_span++;
+          continue;
+        }
+
+      layer_handle = r2007_layer_handle_for_decoded_object (obj);
+      span = *obj_dat;
+      span.chain = &obj_dat->chain[obj->address];
+      span.byte = 0;
+      span.bit = 0;
+      span.size = obj->size;
+
+      error |= scan_r2007_general_raw_strings (
+          dwg, &span, (BITCODE_RLL)obj->address, NULL, layer_handle,
+          obj->handle.value, obj->fixedtype ? obj->fixedtype : obj->type);
+      if (scanned)
+        (*scanned)++;
+      fallback_scanned++;
+      error |= r2007_handle_vec_add (&scanned_handles, obj->handle.value);
+    }
+
+  fprintf (stderr,
+           "R2007 suspicious decoded text raw scan: candidates=%u, "
+           "indexed_probes=%u, invalid_span=%u, fallback_scanned=%u, "
+           "scanned=%u\n",
+           candidates, indexed_probes, invalid_span, fallback_scanned,
+           scanned ? *scanned : 0);
+  r2007_probe_vec_free (&probes);
+  r2007_handle_vec_free (&scanned_handles);
+  return error;
+}
+
+static int
+r2007_scan_probe_text_spans (Dwg_Data *restrict dwg,
+                             Bit_Chain *restrict obj_dat,
+                             unsigned *scanned, unsigned *skipped_large)
+{
+  r2007_probe_vec probes = { 0 };
+  int error = 0;
+  int scan_all = getenv ("LIBDWG_R2007_PROBE_RAW_SCAN_ALL") != NULL;
+  unsigned local_scanned = 0;
+  unsigned scan_limit = 0;
+  const char *limit_env;
+
+  if (!dwg || !obj_dat || !obj_dat->chain)
+    return 0;
+
+  if (scan_all)
+    {
+      scan_limit = 5000;
+      limit_env = getenv ("LIBDWG_R2007_PROBE_RAW_SCAN_LIMIT");
+      if (limit_env && limit_env[0])
+        {
+          unsigned long parsed = strtoul (limit_env, NULL, 10);
+          if (parsed > 0 && parsed <= UINT_MAX)
+            scan_limit = (unsigned)parsed;
+        }
+    }
+
+  error |= r2007_build_probe_index (dwg, obj_dat, &probes);
+  for (size_t i = 0; i < probes.num; i++)
+    {
+      const r2007_probe *probe = &probes.items[i];
+      Bit_Chain span = { 0 };
+      BITCODE_RLL layer_handle;
+
+      if (!scan_all && !r2007_fixed_type_may_have_text (probe->type)
+          && !r2007_class_name_may_have_text (dwg, probe->type)
+          && probe->type != DWG_TYPE_PROXY_ENTITY
+          && probe->type != DWG_TYPE_PROXY_OBJECT
+          && probe->type != DWG_TYPE_UNKNOWN_ENT
+          && probe->type != DWG_TYPE_UNKNOWN_OBJ)
+        continue;
+      if (probe->size > 65536)
+        {
+          if (skipped_large)
+            (*skipped_large)++;
+          continue;
+        }
+
+      layer_handle = r2007_layer_handle_for_probe (dwg, probe);
+      span = *obj_dat;
+      span.chain = &obj_dat->chain[probe->body_address];
+      span.byte = 0;
+      span.bit = 0;
+      span.size = probe->size;
+
+      error |= scan_r2007_general_raw_strings (
+          dwg, &span, (BITCODE_RLL)probe->body_address, NULL, layer_handle,
+          probe->handle, probe->type);
+      if (scanned)
+        (*scanned)++;
+      local_scanned++;
+      if (scan_limit && local_scanned >= scan_limit)
+        break;
+    }
+
+  fprintf (stderr,
+           "R2007 probe-bounded raw scan: probes=%u, scanned=%u, "
+           "skipped_large=%u, scan_all=%u, scan_limit=%u\n",
+           (unsigned)probes.num, scanned ? *scanned : 0,
+           skipped_large ? *skipped_large : 0, (unsigned)scan_all,
+           scan_limit);
+  r2007_probe_vec_free (&probes);
+  return error;
+}
+
+static int
+recover_r2007_unmapped_objects (Dwg_Data *restrict dwg,
+                                Bit_Chain *restrict obj_dat,
+                                Bit_Chain *restrict hdl,
+                                const r2007_handle_vec *failed_addresses)
+{
+  r2007_handle_vec unresolved_layers = { 0 };
+  r2007_handle_vec all_layers = { 0 };
+  r2007_handle_vec cjk_layers = { 0 };
+  BITCODE_RLL high_handle_floor;
+  unsigned recovered_layers = 0;
+  unsigned recovered_textlike = 0;
+  unsigned pattern_hits = 0;
+  unsigned probe_hits = 0;
+  unsigned raw_ascii_s_eq = 0;
+  unsigned raw_utf16_s_eq = 0;
+  unsigned raw_ascii_s_151_94 = 0;
+  unsigned raw_utf16_s_151_94 = 0;
+  unsigned raw_text_hits = 0;
+  unsigned raw_text_probe_hits = 0;
+  unsigned decoded_failed = 0;
+  unsigned raw_scanned_failed = 0;
+  unsigned raw_scanned_suspicious = 0;
+  unsigned raw_scanned_probes = 0;
+  unsigned raw_probe_skipped_large = 0;
+  unsigned layer_ref_decoded = 0;
+  unsigned layer_ref_probe_hits = 0;
+  unsigned layer_fallback_decoded = 0;
+  unsigned layer_fallback_probe_hits = 0;
+  unsigned layer_fallback_linear_decoded = 0;
+  unsigned layer_fallback_linear_probe_hits = 0;
+  unsigned layer_fallback_linear_existing = 0;
+  unsigned layer_fallback_linear_large = 0;
+  int error = 0;
+  r2007_handle_vec decoded_addresses = { 0 };
+
+  if (obj_dat && obj_dat->chain && obj_dat->size >= 4)
+    {
+      static const BITCODE_RC s151_ascii[] = "S=151.94";
+      static const BITCODE_RC s151_utf16[] = {
+        'S', 0, '=', 0, '1', 0, '5', 0, '1', 0,
+        '.', 0, '9', 0, '4', 0
+      };
+      for (size_t i = 0; i + 1 < obj_dat->size; i++)
+        {
+          if (obj_dat->chain[i] == 'S' && obj_dat->chain[i + 1] == '=')
+            raw_ascii_s_eq++;
+          if (i + 3 < obj_dat->size && obj_dat->chain[i] == 'S'
+              && obj_dat->chain[i + 1] == 0 && obj_dat->chain[i + 2] == '='
+              && obj_dat->chain[i + 3] == 0)
+            raw_utf16_s_eq++;
+          if (i + sizeof (s151_ascii) - 1 <= obj_dat->size
+              && memcmp (&obj_dat->chain[i], s151_ascii,
+                         sizeof (s151_ascii) - 1)
+                     == 0)
+            raw_ascii_s_151_94++;
+          if (i + sizeof (s151_utf16) <= obj_dat->size
+              && memcmp (&obj_dat->chain[i], s151_utf16,
+                         sizeof (s151_utf16))
+                     == 0)
+            raw_utf16_s_151_94++;
+        }
+    }
+
+  error |= r2007_collect_unresolved_layer_handles (dwg, &unresolved_layers);
+  error |= r2007_collect_all_layer_handles (dwg, &all_layers);
+  if (!unresolved_layers.num)
+    {
+      r2007_handle_vec_free (&all_layers);
+      r2007_handle_vec_free (&unresolved_layers);
+      return error;
+    }
+
+  high_handle_floor = r2007_max_reasonable_handle (dwg);
+  LOG_INFO ("R2007 recovery: %u unresolved layer handles, "
+            "high-handle floor " FORMAT_HV "\n",
+            (unsigned)unresolved_layers.num, high_handle_floor);
+
+  error |= r2007_recover_unresolved_layers_linear (
+      dwg, obj_dat, hdl, &unresolved_layers, &recovered_layers);
+
+  for (size_t i = 0; i < unresolved_layers.num; i++)
+    {
+      BITCODE_RLL layer_handle = unresolved_layers.items[i];
+      error |= r2007_recover_near_handle_pattern (
+          dwg, obj_dat, hdl, layer_handle, 0, 1, &recovered_layers,
+        &recovered_textlike, &pattern_hits, &probe_hits);
+    }
+
+  error |= r2007_collect_cjk_layer_handles (dwg, &all_layers, &cjk_layers);
+
+  if (getenv ("LIBDWG_R2007_RECOVER_ALL_LAYER_REFS"))
+    {
+      error |= r2007_recover_textlike_by_layer_refs (
+          dwg, obj_dat, hdl, &all_layers, &layer_ref_decoded,
+          &layer_ref_probe_hits);
+      recovered_textlike += layer_ref_decoded;
+    }
+
+  error |= r2007_recover_layer_name_fallback_by_layer_refs (
+      dwg, obj_dat, hdl, cjk_layers.num ? &cjk_layers : &all_layers,
+      &layer_fallback_decoded,
+      &layer_fallback_probe_hits);
+
+  if (!layer_fallback_decoded && cjk_layers.num)
+    {
+      error |= r2007_recover_layer_name_fallback_linear (
+          dwg, obj_dat, hdl, &layer_fallback_linear_decoded,
+          &layer_fallback_linear_probe_hits,
+          &layer_fallback_linear_existing,
+          &layer_fallback_linear_large);
+      recovered_textlike += layer_fallback_linear_decoded;
+    }
+
+  {
+    static const BITCODE_RC s_eq_utf16[] = { 'S', 0, '=', 0 };
+    error |= r2007_recover_near_text_pattern (
+        dwg, obj_dat, hdl, s_eq_utf16, sizeof (s_eq_utf16),
+        &decoded_addresses, &raw_text_hits, &raw_text_probe_hits,
+        &recovered_textlike);
+  }
+
+  error |= r2007_scan_failed_object_spans (
+      dwg, obj_dat, hdl, failed_addresses, &decoded_failed,
+      &raw_scanned_failed, &recovered_textlike);
+
+  error |= r2007_scan_suspicious_decoded_text_spans (
+      dwg, obj_dat, &raw_scanned_suspicious);
+
+  if (getenv ("LIBDWG_R2007_PROBE_RAW_SCAN"))
+    error |= r2007_scan_probe_text_spans (dwg, obj_dat, &raw_scanned_probes,
+                                          &raw_probe_skipped_large);
+
+  error |= scan_r2007_raw_strings (dwg, obj_dat, hdl);
+
+  LOG_INFO ("R2007 recovery recovered layers %u, "
+            "text-like objects %u\n",
+            recovered_layers, recovered_textlike);
+  fprintf (stderr,
+           "R2007 recovery diagnostics: unresolved_layers=%u, "
+           "all_layer_handles=%u, "
+           "raw_S_eq_ascii=%u, raw_S_eq_utf16=%u, pattern_hits=%u, "
+           "probe_hits=%u, raw_S_151_94_ascii=%u, raw_S_151_94_utf16=%u, "
+           "raw_text_hits=%u, raw_text_probe_hits=%u, "
+           "decoded_failed=%u, raw_scanned_failed=%u, "
+           "raw_scanned_suspicious=%u, raw_scanned_probes=%u, "
+           "raw_probe_skipped_large=%u, "
+           "layer_ref_decoded=%u, layer_ref_probe_hits=%u, "
+           "cjk_layer_handles=%u, layer_fallback_decoded=%u, "
+           "layer_fallback_probe_hits=%u, "
+           "layer_fallback_linear_decoded=%u, "
+           "layer_fallback_linear_probe_hits=%u, "
+           "layer_fallback_linear_existing=%u, "
+           "layer_fallback_linear_large=%u, "
+           "raw_text_items=%u, raw_text_s_eq=%u, "
+           "recovered_layers=%u, recovered_textlike=%u\n",
+           (unsigned)unresolved_layers.num, (unsigned)all_layers.num,
+           raw_ascii_s_eq, raw_utf16_s_eq, pattern_hits, probe_hits,
+           raw_ascii_s_151_94, raw_utf16_s_151_94, raw_text_hits,
+           raw_text_probe_hits, decoded_failed,
+           raw_scanned_failed, raw_scanned_suspicious, raw_scanned_probes,
+           raw_probe_skipped_large, layer_ref_decoded,
+           layer_ref_probe_hits, (unsigned)cjk_layers.num,
+           layer_fallback_decoded,
+           layer_fallback_probe_hits,
+           layer_fallback_linear_decoded,
+           layer_fallback_linear_probe_hits,
+           layer_fallback_linear_existing,
+           layer_fallback_linear_large,
+           (unsigned)dwg->r2007_raw_texts.num_items,
+           (unsigned)dwg->r2007_raw_texts.raw_s_eq_count, recovered_layers,
+           recovered_textlike);
+  r2007_dump_raw_texts_if_requested (dwg);
+  r2007_handle_vec_free (&decoded_addresses);
+  r2007_handle_vec_free (&cjk_layers);
+  r2007_handle_vec_free (&all_layers);
+  r2007_handle_vec_free (&unresolved_layers);
+  return error;
+}
+
+static BITCODE_RS
+r2007_read_RS_BE_at (const Bit_Chain *dat, size_t pos)
+{
+  if (!dat || !dat->chain || pos + 1 >= dat->size)
+    return 0;
+  return (BITCODE_RS)((dat->chain[pos] << 8) | dat->chain[pos + 1]);
+}
+
+static int
+r2007_find_next_handles_page (const Bit_Chain *hdl_dat, size_t from,
+                              size_t endpos, size_t *page_pos,
+                              BITCODE_RS *page_size)
+{
+  const size_t scan_limit = 512;
+  size_t maxpos;
+
+  if (!hdl_dat || !hdl_dat->chain || from >= endpos)
+    return 0;
+  maxpos = from + scan_limit;
+  if (maxpos > endpos)
+    maxpos = endpos;
+
+  for (size_t pos = from; pos + 4 <= maxpos; pos++)
+    {
+      BITCODE_RS size = r2007_read_RS_BE_at (hdl_dat, pos);
+      uint16_t crc_read, crc_calc;
+
+      if (size < 2 || size > 2050)
+        continue;
+      if (pos + size + 2 > endpos)
+        continue;
+
+      crc_read = r2007_read_RS_BE_at (hdl_dat, pos + size);
+      crc_calc = bit_calc_CRC (0xC0C1, &hdl_dat->chain[pos], size);
+      if (crc_read == crc_calc)
+        {
+          if (page_pos)
+            *page_pos = pos;
+          if (page_size)
+            *page_size = size;
+          return 1;
+        }
+    }
+
+  return 0;
+}
+
 static int
 read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
                            Dwg_Data *restrict dwg,
@@ -1660,10 +4654,16 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
   static Bit_Chain obj_dat = { 0 }, hdl_dat = { 0 };
   BITCODE_RS section_size = 0;
   size_t endpos;
+  size_t map_last_offset = 0;
+  BITCODE_RLL map_last_handle = 0;
+  unsigned page_index = 0;
+  unsigned decoded_objects = 0;
+  unsigned failed_objects = 0;
+  unsigned handle_mismatches = 0;
+  r2007_handle_vec failed_addresses = { 0 };
   int error;
 
-  error = read_data_section (&obj_dat, dat, sections_map, pages_map,
-                             SECTION_OBJECTS);
+  error = read_data_section (&obj_dat, dat, dwg, sections_map, pages_map, SECTION_OBJECTS);
   if (error >= DWG_ERR_CRITICAL || !obj_dat.chain)
     {
       LOG_ERROR ("Failed to read objects section");
@@ -1671,10 +4671,10 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
         free (obj_dat.chain);
       return error;
     }
+  r2007_dump_section_if_requested ("LIBDWG_DUMP_R2007_OBJECTS", &obj_dat);
 
   LOG_TRACE ("\nHandles\n-------------------\n");
-  error = read_data_section (&hdl_dat, dat, sections_map, pages_map,
-                             SECTION_HANDLES);
+  error = read_data_section (&hdl_dat, dat, dwg, sections_map, pages_map, SECTION_HANDLES);
   if (error >= DWG_ERR_CRITICAL || !hdl_dat.chain)
     {
       LOG_ERROR ("Failed to read handles section");
@@ -1691,52 +4691,123 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
 
   do
     {
-      size_t last_offset;
-      // uint64_t last_handle;
+      size_t last_offset = 0;
+      BITCODE_RLL last_handle = 0;
       size_t oldpos = 0;
       size_t startpos = hdl_dat.byte;
       uint16_t crc1, crc2;
+      int crossed_boundary = 0;
 
       section_size = bit_read_RS_BE (&hdl_dat);
-      LOG_TRACE ("\nSection size: %u\n", section_size);
-      if (section_size > 2050)
+      LOG_TRACE ("\nSection[%u] size: %u\n", page_index, section_size);
+      if (section_size > 2050 || section_size < 2)
         {
-          LOG_ERROR ("Object-map/handles section size greater than 2050!");
-          return DWG_ERR_VALUEOUTOFBOUNDS;
+          size_t resync_pos = 0;
+          BITCODE_RS resync_size = 0;
+          LOG_ERROR ("Object-map/handles section[%u] invalid size %u",
+                     page_index, section_size);
+          error |= DWG_ERR_VALUEOUTOFBOUNDS;
+          if (r2007_find_next_handles_page (&hdl_dat, startpos + 1, endpos,
+                                            &resync_pos, &resync_size))
+            {
+              LOG_WARN ("Object-map/handles section[%u] resynced from %"
+                        PRIuSIZE " to %" PRIuSIZE " (size %u)",
+                        page_index, startpos, resync_pos, resync_size);
+              fprintf (stderr,
+                       "R2007 object-map resync section[%u]: %" PRIuSIZE
+                       " -> %" PRIuSIZE " size=%u\n",
+                       page_index, startpos, resync_pos, resync_size);
+              hdl_dat.byte = resync_pos;
+              hdl_dat.bit = 0;
+              section_size = resync_size;
+              page_index++;
+              continue;
+            }
+          break;
         }
 
-      last_offset = 0;
       while ((long)(hdl_dat.byte - startpos) < (long)section_size)
         {
           int added;
+          BITCODE_BL prev_num_objects = dwg->num_objects;
+          BITCODE_RLL expected_handle;
           BITCODE_UMC handleoff;
           BITCODE_MC offset;
 
           oldpos = hdl_dat.byte;
           handleoff = bit_read_UMC (&hdl_dat);
           offset = bit_read_MC (&hdl_dat);
+          if (hdl_dat.byte - startpos > section_size)
+            {
+              LOG_WARN ("Handles section[%u] entry crosses page boundary "
+                        "@%" PRIuSIZE ", rewind to CRC boundary",
+                        page_index, oldpos);
+              hdl_dat.byte = oldpos;
+              hdl_dat.bit = 0;
+              crossed_boundary = 1;
+              break;
+            }
+          expected_handle = last_handle + handleoff;
           last_offset += offset;
           LOG_TRACE ("\nNext object: %lu ", (unsigned long)dwg->num_objects);
           LOG_TRACE ("Handleoff: " FORMAT_UMC " [UMC] "
+                     "Handle: " FORMAT_HV " [map] "
                      "Offset: " FORMAT_MC " [MC] @%" PRIuSIZE "\n",
-                     handleoff, offset, last_offset);
+                     handleoff, expected_handle, offset, last_offset);
 
           if (hdl_dat.byte == oldpos)
             break;
 
           added = dwg_decode_add_object (dwg, &obj_dat, hdl, last_offset);
           if (added > 0)
-            error |= added;
+            {
+              failed_objects++;
+              error |= r2007_handle_vec_add (&failed_addresses,
+                                             (BITCODE_RLL)last_offset);
+              error |= added;
+            }
+          if (dwg->num_objects > prev_num_objects)
+            {
+              Dwg_Object *added_obj = &dwg->object[dwg->num_objects - 1];
+              decoded_objects++;
+              if (expected_handle && added_obj->handle.value
+                  && added_obj->handle.value != expected_handle)
+                {
+                  handle_mismatches++;
+                  LOG_WARN ("Object-map handle mismatch section[%u]: map "
+                            FORMAT_HV " decoded " FORMAT_HV
+                            " at object %lu offset %" PRIuSIZE,
+                            page_index, expected_handle,
+                            added_obj->handle.value,
+                            (unsigned long)added_obj->index, last_offset);
+                }
+            }
+          else
+            {
+              error |= r2007_handle_vec_add (&failed_addresses,
+                                             (BITCODE_RLL)last_offset);
+            }
+          last_handle = expected_handle;
+          map_last_handle = expected_handle;
+          map_last_offset = last_offset;
         }
 
-      if (hdl_dat.byte == oldpos)
+      if (hdl_dat.byte == oldpos && !crossed_boundary)
         break;
+      if (hdl_dat.byte != startpos + section_size)
+        {
+          LOG_WARN ("Handles section[%u] ended at %" PRIuSIZE
+                    ", expected CRC boundary %" PRIuSIZE,
+                    page_index, hdl_dat.byte, startpos + section_size);
+          hdl_dat.byte = startpos + section_size;
+          hdl_dat.bit = 0;
+        }
 #if 0
       if (!bit_check_CRC(&hdl_dat, startpos, 0xC0C1))
         LOG_WARN("Handles section CRC mismatch at offset %lx", startpos);
 #else
       crc1 = bit_calc_CRC (0xC0C1, &(hdl_dat.chain[startpos]),
-                           hdl_dat.byte - startpos);
+                           section_size);
       crc2 = bit_read_RS_BE (&hdl_dat);
       if (crc1 == crc2)
         {
@@ -1754,13 +4825,36 @@ read_2007_section_handles (Bit_Chain *dat, Bit_Chain *hdl,
 
       if (hdl_dat.byte >= endpos)
         break;
+      page_index++;
+      if (page_index > 10000)
+        {
+          LOG_ERROR ("Object-map/handles section page limit exceeded");
+          error |= DWG_ERR_VALUEOUTOFBOUNDS;
+          break;
+        }
     }
   while (section_size > 2);   
+
+  fprintf (stderr,
+           "R2007 object map decoded %u objects, failed %u, "
+           "handle mismatches %u, last handle " FORMAT_HV
+           ", last offset %" PRIuSIZE "\n",
+           decoded_objects, failed_objects, handle_mismatches,
+           map_last_handle, map_last_offset);
+  LOG_INFO ("R2007 object map decoded %u objects, failed %u, "
+            "handle mismatches %u, last handle " FORMAT_HV
+            ", last offset %" PRIuSIZE "\n",
+            decoded_objects, failed_objects, handle_mismatches,
+            map_last_handle, map_last_offset);
+
+  error |= recover_r2007_unmapped_objects (dwg, &obj_dat, hdl,
+                                           &failed_addresses);
 
   if (hdl_dat.chain)
     free (hdl_dat.chain);
   if (obj_dat.chain)
     free (obj_dat.chain);
+  r2007_handle_vec_free (&failed_addresses);
   return error;
 }
 
@@ -1955,8 +5049,7 @@ read_2007_section_vbaproject (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   // BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // not compressed, page size: 0x80
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_VBAPROJECT);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_VBAPROJECT);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "VBAProject");
@@ -1996,8 +5089,7 @@ read_2007_section_summary (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   old_dat = *dat;
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_SUMMARYINFO);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_SUMMARYINFO);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_ERROR ("Failed to read SummaryInfo section");
@@ -2039,8 +5131,7 @@ read_2007_section_appinfo (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // not compressed, page size: 0x80
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_APPINFO);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_APPINFO);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "AppInfo");
@@ -2080,8 +5171,7 @@ read_2007_section_auxheader (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL vcount = 0, rcount1 = 0, rcount2 = 0;
 
   // type: 2, compressed, page size: 0x7400
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_AUXHEADER);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_AUXHEADER);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "AuxHeader");
@@ -2123,8 +5213,7 @@ read_2007_section_appinfohistory (Bit_Chain *restrict dat,
   // BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed, page size: 0x580
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_APPINFOHISTORY);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_APPINFOHISTORY);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "AppInfoHistory");
@@ -2166,8 +5255,7 @@ read_2007_section_revhistory (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed, page size: 0x7400
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_REVHISTORY);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_REVHISTORY);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "RevHistory");
@@ -2209,8 +5297,7 @@ read_2007_section_objfreespace (Bit_Chain *restrict dat,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed, page size: 0x7400
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_OBJFREESPACE);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_OBJFREESPACE);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "ObjFreeSpace");
@@ -2252,8 +5339,7 @@ read_2007_section_template (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_TEMPLATE);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_TEMPLATE);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_ERROR ("%s section not found\n", "Template");
@@ -2299,8 +5385,7 @@ read_2007_section_filedeplist (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // not compressed, page size: 0x80. 0xc or 0xd
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_FILEDEPLIST);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_FILEDEPLIST);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "FileDepList");
@@ -2341,8 +5426,7 @@ read_2007_section_security (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed, page size: 0x7400
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_SECURITY);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_SECURITY);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "Security");
@@ -2383,8 +5467,7 @@ read_2007_section_signature (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RL rcount1 = 0, rcount2 = 0;
 
   // compressed, page size: 0x7400
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_SIGNATURE);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_SIGNATURE);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", "Signature");
@@ -2439,8 +5522,7 @@ read_2007_section_acds (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   const char *secname = "AcDsPrototype_1b";
 
   // compressed, pagesize 0x7400, type 13
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_ACDS);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_ACDS);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_INFO ("%s section not found\n", secname);
@@ -2457,6 +5539,9 @@ read_2007_section_acds (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
 
   error |= acds_private (dat, dwg);
   error &= ~DWG_ERR_SECTIONNOTFOUND;
+  error |= scan_r2007_general_raw_strings (dwg, &sec_dat,
+                                           ((BITCODE_RLL)0x7f << 56),
+                                           "ACDS", 0, 0, 0);
 
   LOG_TRACE ("\n");
   if (sec_dat.chain)
@@ -2476,8 +5561,7 @@ read_2007_section_preview (Bit_Chain *restrict dat, Dwg_Data *restrict dwg,
   BITCODE_RC type;
   const unsigned char *sentinel;
 
-  error = read_data_section (&sec_dat, dat, sections_map, pages_map,
-                             SECTION_PREVIEW);
+  error = read_data_section (&sec_dat, dat, dwg, sections_map, pages_map, SECTION_PREVIEW);
   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
     {
       LOG_ERROR ("Failed to read uncompressed %s section", "Preview");

@@ -11419,6 +11419,27 @@ typedef struct _dwg_secondheader
  Main DWG struct
  */
 
+typedef struct _dwg_raw_text_recovery_item
+{
+  char *text;
+  BITCODE_RLL layer_handle;
+  BITCODE_RLL object_handle;
+  BITCODE_RLL address;
+  BITCODE_BS object_type;
+  BITCODE_RC source;
+} Dwg_RawTextRecoveryItem;
+
+typedef struct _dwg_raw_text_recovery
+{
+  Dwg_RawTextRecoveryItem *items;
+  BITCODE_BL num_items;
+  BITCODE_BL capacity;
+  BITCODE_BL raw_s_eq_count;
+  BITCODE_BL raw_cjk_count;
+  BITCODE_BL raw_unassigned_count;
+  BITCODE_BL raw_filtered_count;
+} Dwg_RawTextRecovery;
+
 typedef struct _dwg_struct
 {
   Dwg_Header header;
@@ -11479,6 +11500,7 @@ typedef struct _dwg_struct
   // for speedup dwg_add_handleref
   Dwg_Object_Ref **object_ordered_ref; /*! list of all ordered objects refs */
   BITCODE_BL num_object_ordered_refs;  /*! number of ordered objects refs */
+  Dwg_RawTextRecovery r2007_raw_texts;  /*! recovered raw R2007 text strings */
 } Dwg_Data;
 
 #define DWG_OPTS_LOGLEVEL 0xf
